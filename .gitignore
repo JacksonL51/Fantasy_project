@@ -1,0 +1,33 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Local Project Data (Prevent large CSVs/JSONs from being committed)
+data/raw/
+data/processed/
+*.csv
+*.parquet
+*.sqlite3
+*.db
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# IDEs & Editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Environment Variables & Secrets
+.env
