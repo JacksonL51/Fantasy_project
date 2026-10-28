@@ -22,6 +22,7 @@ COUNTING_STATS = [
 	"TOV",
 ]
 RATE_COLUMNS = {stat: f"{stat}_RATE" for stat in COUNTING_STATS}
+MINIMUM_SEASON_MINUTES = 200
 
 
 def prepare_training_data(
@@ -72,9 +73,9 @@ def build_training_pairs(
 	)
 	prior["YEAR_NEXT"] = prior["YEAR_CURRENT"] + 1
 
-	target_columns = {"SEASON": "YEAR_NEXT"}
+	target_columns = {"SEASON": "YEAR_NEXT", "MIN": "MIN_target"}
 	target_columns.update({rate: f"{stat}_RATE_target" for stat, rate in RATE_COLUMNS.items()})
-	target = training_data[["PLAYER_ID", "SEASON", *RATE_COLUMNS.values()]].rename(columns=target_columns)
+	target = training_data[["PLAYER_ID", "SEASON", "MIN", *RATE_COLUMNS.values()]].rename(columns=target_columns)
 
 	training_pairs = prior.merge(
 		target,
@@ -82,6 +83,10 @@ def build_training_pairs(
 		how="inner",
 		validate="one_to_one",
 	)
+	training_pairs = training_pairs[
+		(training_pairs["MIN_prior"] >= MINIMUM_SEASON_MINUTES)
+		& (training_pairs["MIN_target"] >= MINIMUM_SEASON_MINUTES)
+	].copy()
 
 	output_path.parent.mkdir(parents=True, exist_ok=True)
 	training_pairs.to_csv(output_path, index=False)
