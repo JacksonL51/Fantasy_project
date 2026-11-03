@@ -67,7 +67,7 @@ BOOTSTRAP_SEED = 20261028
 FT_PRIOR_SHRINKAGE = 0.05
 SHRINKAGE_FALLBACK_STATS = frozenset({"FTM", "FTA"})
 QUARTILE_CHECK_STATS = ("AST",)
-WEIGHT_NORMALIZATION = "MIN_target divided by training-set mean"
+SAMPLE_WEIGHT_FORMULA = "sqrt(MIN_target)"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
@@ -184,7 +184,7 @@ def fit_stat_model(
     alpha: float,
     formulation: str,
 ) -> Pipeline:
-    """Fit one rate model with mean-one minute weights.
+    """Fit one rate model with square-root target-minute sample weights.
 
     "level" predicts the target rate; "delta" predicts target minus prior,
     which shrinks toward "no change" instead of toward the league mean.
@@ -195,8 +195,7 @@ def fit_stat_model(
     if formulation == "delta":
         target = target - train[f"{stat}_RATE_prior"]
 
-    sample_weight = train["MIN_target"].to_numpy(dtype=float)
-    sample_weight = sample_weight / sample_weight.mean()
+    sample_weight = np.sqrt(train["MIN_target"].to_numpy(dtype=float))
     model = create_rate_model(alpha)
     model.fit(
         train[FEATURES_BY_STAT[stat]],
@@ -288,7 +287,7 @@ def build_bundle(
             )
             for stat in TARGET_STATS
         },
-        "weight_normalization": WEIGHT_NORMALIZATION,
+        "sample_weight_formula": SAMPLE_WEIGHT_FORMULA,
         "fit_transition_years": sorted(
             int(year) for year in train["YEAR_NEXT"].unique()
         ),
@@ -965,7 +964,7 @@ def run_phase_four(pairs: pd.DataFrame) -> dict[str, object]:
         "full_training_rows": len(pairs),
         "fit_transition_years": bundle["fit_transition_years"],
         "alpha_grid": ALPHA_GRID,
-        "weight_normalization": WEIGHT_NORMALIZATION,
+        "sample_weight_formula": SAMPLE_WEIGHT_FORMULA,
         "ranking_minutes_threshold": RANKING_MINUTES_THRESHOLD,
         "bootstrap_iterations": BOOTSTRAP_ITERATIONS,
         "bootstrap_seed": BOOTSTRAP_SEED,

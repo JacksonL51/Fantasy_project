@@ -3,16 +3,15 @@ import time
 from typing import Iterable, List
 
 import pandas as pd
-from nba_api.stats.endpoints import commonteamroster, leaguedashplayerstats
-from nba_api.stats.static import teams
+from nba_api.stats.endpoints import commonallplayers, leaguedashplayerstats
 from nba_api.stats.library.parameters import Season
 from nba_api.stats.library import http as stats_http
-from nba_api.stats.endpoints import commonallplayers, commonteamroster, leaguedashplayerstats
 
 RAW_DATA_DIR = os.path.join("data", "raw")
 PROCESSED_DATA_DIR = os.path.join("data", "processed")
 HISTORICAL_STATS_PATH = os.path.join(RAW_DATA_DIR, "historical_stats.csv")
 CURRENT_ROSTERS_PATH = os.path.join(RAW_DATA_DIR, "current_rosters.csv")
+NBA_STATS_FIRST_SEASON_START_YEAR = 1996
 
 # Custom browser headers to avoid stats.nba.com silent drops
 CUSTOM_HEADERS = {
@@ -146,6 +145,18 @@ def _get_current_roster_player_ids() -> set[int] | None:
     return set(roster_ids)
 
 
+def _completed_seasons() -> List[str]:
+    """Return API-supported seasons through the last completed season."""
+    last_season = Season.previous_season
+    last_start_year = int(last_season[:4])
+    return [
+        f"{start_year}-{(start_year + 1) % 100:02d}"
+        for start_year in range(
+            NBA_STATS_FIRST_SEASON_START_YEAR, last_start_year + 1
+        )
+    ]
+
+
 def _fetch_with_retry(operation, label: str, max_retries: int = 3, base_delay: float = 2.0):
     last_error = None
     for attempt in range(1, max_retries + 1):
@@ -168,29 +179,55 @@ def fetch_historical_stats(
 ) -> pd.DataFrame:
     """
     Fetches multi-season player box-score totals and stores a normalized raw snapshot to data/raw/historical_stats.csv.
-    If a cache already exists and force_refresh is False, the cached file is reused.
-    Optionally filters the saved dataset to the current roster player IDs.
+    By default, fetches every season supported by the endpoint through the last
+    completed season. The complete league cache is retained, while an optional
+    roster_player_ids argument filters only the returned DataFrame.
     """
     ensure_dirs()
 
     if seasons is None:
-        seasons = ["2022-23", "2023-24", "2024-25", "2025-26"]
+        seasons = _completed_seasons()
+    else:
+        seasons = list(seasons)
 
     if roster_player_ids is None:
         roster_player_ids = _get_current_roster_player_ids()
+    if roster_player_ids is not None:
+        roster_player_ids = set(roster_player_ids)
 
+    cached_df = pd.DataFrame()
     if not force_refresh and os.path.exists(HISTORICAL_STATS_PATH):
         print(f"Loading cached historical stats from {HISTORICAL_STATS_PATH}...")
         cached_df = _load_cached_dataframe(HISTORICAL_STATS_PATH)
         if not cached_df.empty:
             cleaned_df = _normalize_columns(cached_df)
-            if roster_player_ids is not None:
-                cleaned_df["PLAYER_ID"] = pd.to_numeric(cleaned_df["PLAYER_ID"], errors="coerce")
-                cleaned_df = cleaned_df[cleaned_df["PLAYER_ID"].isin(roster_player_ids)].copy()
-                cleaned_df.to_csv(HISTORICAL_STATS_PATH, index=False)
-            return cleaned_df
+            cached_seasons = set(cleaned_df["SEASON"].dropna().astype(str))
+            requested_seasons = set(seasons)
+            if requested_seasons.issubset(cached_seasons):
+                if roster_player_ids is not None:
+                    player_ids = pd.to_numeric(
+                        cleaned_df["PLAYER_ID"], errors="coerce"
+                    )
+                    cleaned_df = cleaned_df.loc[
+                        player_ids.isin(roster_player_ids)
+                    ].copy()
+                print(
+                    f"Using cached historical stats through "
+                    f"{max(cached_seasons)} ({len(cleaned_df)} rows)."
+                )
+                return cleaned_df
+
+            # Older cache files were limited to recent seasons and current-roster
+            # players. Rebuild them completely once so earlier player histories
+            # are not permanently missing from the expanded cache.
+            if seasons[0] not in cached_seasons:
+                print("Cached history does not cover the requested range; rebuilding it.")
+                cached_df = pd.DataFrame()
+            else:
+                seasons = [season for season in seasons if season not in cached_seasons]
 
     all_dfs = []
+    failed_seasons = []
     for season in seasons:
         print(f"Fetching stats for season {season}...")
         try:
@@ -205,16 +242,22 @@ def fetch_historical_stats(
             season_df = _normalize_columns(season_df)
             season_df["SEASON"] = season
             _validate_columns(season_df, REQUIRED_HISTORICAL_COLUMNS | {"SEASON"}, f"Historical stats for {season}")
+            if season_df.empty:
+                print(f"No stats returned for season {season}.")
+                failed_seasons.append(season)
+                continue
             all_dfs.append(season_df)
             time.sleep(1.5)
         except Exception as exc:
             print(f"Error fetching season {season}: {exc}")
+            failed_seasons.append(season)
 
-    if not all_dfs:
+    if not all_dfs and cached_df.empty:
         print("No historical stats fetched.")
         return pd.DataFrame()
 
-    combined_df = pd.concat(all_dfs, ignore_index=True)
+    frames = [frame for frame in (cached_df, *all_dfs) if not frame.empty]
+    combined_df = pd.concat(frames, ignore_index=True)
     combined_df = _coerce_numeric_columns(
         combined_df,
         [
@@ -238,16 +281,28 @@ def fetch_historical_stats(
     )
     combined_df = combined_df.drop_duplicates(subset=["PLAYER_ID", "SEASON"], keep="last").reset_index(drop=True)
 
-    if roster_player_ids is not None:
-        combined_df["PLAYER_ID"] = pd.to_numeric(combined_df["PLAYER_ID"], errors="coerce")
-        combined_df = combined_df[combined_df["PLAYER_ID"].isin(roster_player_ids)].copy()
-
-    # Keep only player and stat fields needed for the fantasy model.
+    # Keep the cache complete and unfiltered; return a roster-scoped copy below.
+    # This avoids losing history when the current roster changes between runs.
     selected_columns = [col for col in SELECTED_HISTORICAL_COLUMNS if col in combined_df.columns]
     combined_df = combined_df[selected_columns]
     combined_df.to_csv(HISTORICAL_STATS_PATH, index=False)
-    print(f"Saved historical stats to {HISTORICAL_STATS_PATH} ({len(combined_df)} rows).")
-    return combined_df
+
+    if roster_player_ids is not None:
+        player_ids = pd.to_numeric(combined_df["PLAYER_ID"], errors="coerce")
+        result_df = combined_df.loc[player_ids.isin(roster_player_ids)].copy()
+    else:
+        result_df = combined_df
+
+    if failed_seasons:
+        print(
+            "Warning: historical stats could not be fetched for seasons: "
+            + ", ".join(failed_seasons)
+        )
+    print(
+        f"Saved complete historical stats to {HISTORICAL_STATS_PATH} "
+        f"({len(combined_df)} rows); returning {len(result_df)} rows."
+    )
+    return result_df
 
 
 def fetch_current_rosters(season: str = "2026-27", force_refresh: bool = False) -> pd.DataFrame:
