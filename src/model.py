@@ -2,12 +2,16 @@
 
 Pipeline
 --------
-1. Build expanding-window validation folds from the most recent transitions.
-2. Tune (formulation, alpha) for every stat on those folds.
-3. Decide per stat whether the tuned model replaces a simple fallback
+1. Load transitions (t -> t+1) and attach each player's multi-season history
+   features as of season t (history.py).
+2. Build expanding-window validation folds from the most recent transitions.
+3. Tune (feature set, formulation, alpha) for every stat on those folds.
+   Feature sets: "base" (last season only) and "history" (last season plus a
+   recency/minutes-weighted multi-season rate and its sample size).
+4. Decide per stat whether the tuned model replaces a simple fallback
    (naive prior rate, prior shrinkage, or component-derived points).
-4. Re-score the chosen policies fold by fold and run diagnostics.
-5. Refit on all transitions and persist the bundle plus metadata for Phase 5.
+5. Re-score the chosen policies fold by fold and run diagnostics.
+6. Refit on the training window and persist the bundle plus metadata.
 
 Fold evaluation and production inference share `build_bundle` and
 `predict_rates`, so the policy that gets validated is the policy that ships.
@@ -15,7 +19,8 @@ Fold evaluation and production inference share `build_bundle` and
 Selection rule (see `decide_policy`): the tuned model is accepted for a stat
 only if its improvement over the naive prior is positive in EVERY validation
 fold AND the 95% bootstrap interval of the pooled improvement (all fold rows
-combined) excludes zero.
+combined) excludes zero. The history feature set has to earn its place the
+same way: it only ships if it wins the tuning grid and then beats naive.
 
 Known limitation: tuning, selection and scoring all use the same folds, so
 the reported selected-policy numbers are optimistic. The first genuinely
@@ -34,6 +39,8 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from history import compute_history_features, history_feature_columns, load_history
+
 
 TARGET_STATS = [
     "FGM",
@@ -48,8 +55,29 @@ TARGET_STATS = [
     "PTS",
     "TOV",
 ]
+FEATURE_SETS = ("base", "history")
+
+
+def features_for(stat: str, feature_set: str) -> list[str]:
+    """Model input columns for one stat. The own prior rate is always first."""
+    base = [f"{stat}_RATE_prior", "AGE_prior", "AGE_SQ", "MIN_prior"]
+    if feature_set == "base":
+        return base
+    if feature_set == "history":
+        return [
+            f"{stat}_RATE_prior",
+            f"{stat}_RATE_hist",
+            "AGE_prior",
+            "AGE_SQ",
+            "MIN_prior",
+            "HIST_MIN",
+            "HIST_SEASONS",
+        ]
+    raise ValueError(f"Unknown feature set: {feature_set}")
+
+
 FEATURES_BY_STAT = {
-    stat: [f"{stat}_RATE_prior", "AGE_prior", "AGE_SQ", "MIN_prior"]
+    stat: {feature_set: features_for(stat, feature_set) for feature_set in FEATURE_SETS}
     for stat in TARGET_STATS
 }
 
@@ -57,6 +85,10 @@ FEATURES_BY_STAT = {
 ALPHA_GRID = (0.01, 0.1, 1.0, 10.0)
 MODEL_FORMULATIONS = ("level", "delta")
 N_VALIDATION_FOLDS = 2  # the most recent N target seasons become folds
+# With a long history, older eras may differ from today's game. Set this to an
+# integer (e.g. 12) to train only on the most recent N target seasons before
+# each fold; None uses every earlier transition.
+TRAIN_WINDOW_YEARS: int | None = None
 # NOTE: training_pairs.csv already filters MIN_prior >= 200, so 200 removes
 # nothing here. Raise it (e.g. 800) to rank only fantasy-relevant players.
 RANKING_MINUTES_THRESHOLD = 200.0
@@ -67,11 +99,12 @@ BOOTSTRAP_SEED = 20261028
 FT_PRIOR_SHRINKAGE = 0.05
 SHRINKAGE_FALLBACK_STATS = frozenset({"FTM", "FTA"})
 QUARTILE_CHECK_STATS = ("AST",)
-SAMPLE_WEIGHT_FORMULA = "sqrt(MIN_target)"
+WEIGHT_NORMALIZATION = "MIN_target divided by training-set mean"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 TRAINING_PAIRS_PATH = PROCESSED_DIR / "training_pairs.csv"
+TRAINING_DATA_PATH = PROCESSED_DIR / "training_data.csv"
 VALIDATION_METRICS_PATH = PROCESSED_DIR / "validation_metrics.csv"
 ALPHA_GRID_METRICS_PATH = PROCESSED_DIR / "alpha_grid_metrics.csv"
 FOLD_METRICS_PATH = PROCESSED_DIR / "rolling_fold_metrics.csv"
@@ -83,6 +116,7 @@ MODEL_BUNDLE_PATH = PROCESSED_DIR / "rate_models.joblib"
 MODEL_METADATA_PATH = PROCESSED_DIR / "rate_model_metadata.json"
 
 REQUIRED_COLUMNS = [
+    "PLAYER_ID",
     "AGE_prior",
     "MIN_prior",
     "MIN_target",
@@ -94,6 +128,7 @@ REQUIRED_COLUMNS = [
         for column in (f"{stat}_RATE_prior", f"{stat}_RATE_target")
     ],
 ]
+HISTORY_COLUMNS = history_feature_columns(TARGET_STATS)
 
 
 # --------------------------------------------------------------------------
@@ -101,8 +136,9 @@ REQUIRED_COLUMNS = [
 # --------------------------------------------------------------------------
 def load_training_pairs(
     csv_path: Path = TRAINING_PAIRS_PATH,
+    history_path: Path = TRAINING_DATA_PATH,
 ) -> pd.DataFrame:
-    """Load transitions with complete, finite values in every modeling column."""
+    """Load transitions and attach each player's history features as of YEAR_CURRENT."""
     pairs = pd.read_csv(csv_path)
     missing_columns = [
         column for column in REQUIRED_COLUMNS if column not in pairs.columns
@@ -113,18 +149,42 @@ def load_training_pairs(
             + ", ".join(missing_columns)
         )
 
-    required_values = pairs[REQUIRED_COLUMNS].apply(
-        pd.to_numeric, errors="coerce"
-    )
+    required_values = pairs[REQUIRED_COLUMNS].apply(pd.to_numeric, errors="coerce")
     finite_rows = np.isfinite(required_values.to_numpy(dtype=float)).all(axis=1)
     pairs = pairs.loc[finite_rows].copy()
     pairs.loc[:, REQUIRED_COLUMNS] = required_values.loc[finite_rows]
+    for column in ("PLAYER_ID", "YEAR_CURRENT", "YEAR_NEXT"):
+        pairs[column] = pairs[column].astype("int64")
     pairs["AGE_SQ"] = pairs["AGE_prior"] ** 2
+
+    history = load_history(history_path, TARGET_STATS)
+    features = compute_history_features(history, TARGET_STATS).rename(
+        columns={"SEASON_YEAR": "YEAR_CURRENT"}
+    )
+    pairs = pairs.merge(features, on=["PLAYER_ID", "YEAR_CURRENT"], how="left")
+    covered = pairs["HIST_MIN"].notna()
+    if covered.mean() < 0.99:
+        raise ValueError(
+            f"Only {covered.mean():.1%} of transitions matched a history row on "
+            "(PLAYER_ID, YEAR_CURRENT). Check that SEASON in training_data.csv "
+            "and YEAR_CURRENT in training_pairs.csv use the same year convention."
+        )
+    if (~covered).any():
+        print(f"Warning: dropping {int((~covered).sum())} transitions without history.")
+        pairs = pairs.loc[covered].copy()
 
     print(f"Valid transitions: {len(pairs)}")
     print("Transitions per YEAR_NEXT:")
     print(pairs["YEAR_NEXT"].value_counts().sort_index().to_string())
     return pairs
+
+
+def _train_slice(pairs: pd.DataFrame, before_year: int) -> pd.DataFrame:
+    """Transitions with YEAR_NEXT < before_year, limited to the training window."""
+    mask = pairs["YEAR_NEXT"] < before_year
+    if TRAIN_WINDOW_YEARS is not None:
+        mask &= pairs["YEAR_NEXT"] >= before_year - TRAIN_WINDOW_YEARS
+    return pairs.loc[mask].copy()
 
 
 def rolling_origin_folds(
@@ -133,9 +193,9 @@ def rolling_origin_folds(
 ) -> list[tuple[int, pd.DataFrame, pd.DataFrame]]:
     """Expanding-window folds over the most recent `n_folds` target seasons.
 
-    Fold for season Y trains on every transition with YEAR_NEXT < Y and
-    validates on the Y-1 -> Y transition. Adding seasons to the data
-    automatically moves the folds forward.
+    Fold for season Y trains on earlier transitions (YEAR_NEXT < Y, limited to
+    TRAIN_WINDOW_YEARS if set) and validates on the Y-1 -> Y transition.
+    Adding seasons to the data automatically moves the folds forward.
     """
     years = sorted(int(year) for year in pairs["YEAR_NEXT"].unique())
     if len(years) <= n_folds:
@@ -146,7 +206,7 @@ def rolling_origin_folds(
 
     folds = []
     for year in years[-n_folds:]:
-        train = pairs.loc[pairs["YEAR_NEXT"] < year].copy()
+        train = _train_slice(pairs, year)
         validation = pairs.loc[
             (pairs["YEAR_CURRENT"] == year - 1) & (pairs["YEAR_NEXT"] == year)
         ].copy()
@@ -183,8 +243,9 @@ def fit_stat_model(
     stat: str,
     alpha: float,
     formulation: str,
+    feature_set: str = "base",
 ) -> Pipeline:
-    """Fit one rate model with square-root target-minute sample weights.
+    """Fit one rate model with mean-one minute weights.
 
     "level" predicts the target rate; "delta" predicts target minus prior,
     which shrinks toward "no change" instead of toward the league mean.
@@ -195,10 +256,11 @@ def fit_stat_model(
     if formulation == "delta":
         target = target - train[f"{stat}_RATE_prior"]
 
-    sample_weight = np.sqrt(train["MIN_target"].to_numpy(dtype=float))
+    sample_weight = train["MIN_target"].to_numpy(dtype=float)
+    sample_weight = sample_weight / sample_weight.mean()
     model = create_rate_model(alpha)
     model.fit(
-        train[FEATURES_BY_STAT[stat]],
+        train[features_for(stat, feature_set)],
         target,
         ridge__sample_weight=sample_weight,
     )
@@ -210,29 +272,44 @@ def predict_stat_model(
     data: pd.DataFrame,
     stat: str,
     formulation: str,
+    feature_set: str = "base",
 ) -> np.ndarray:
     """Predict a rate, adding the prior back for a delta model."""
-    prediction = model.predict(data[FEATURES_BY_STAT[stat]])
+    prediction = model.predict(data[features_for(stat, feature_set)])
     if formulation == "delta":
         prediction = data[f"{stat}_RATE_prior"].to_numpy(dtype=float) + prediction
     return np.asarray(prediction, dtype=float)
 
 
 def _coefficient_record(
-    model: Pipeline, stat: str, formulation: str, alpha: float, stage: str
+    model: Pipeline,
+    stat: str,
+    formulation: str,
+    alpha: float,
+    stage: str,
+    feature_set: str,
 ) -> dict[str, float | str]:
-    """Own-rate coefficient on the raw (unstandardized) level scale."""
+    """Own-rate coefficients on the raw (unstandardized) level scale.
+
+    The own prior rate is always the first feature; for the history feature
+    set the multi-season rate is the second.
+    """
     ridge = model.named_steps["ridge"]
     scaler = model.named_steps["scaler"]
-    own_rate_coefficient = float((ridge.coef_ / scaler.scale_)[0])
+    raw = ridge.coef_ / scaler.scale_
+    own_rate_coefficient = float(raw[0])
     if formulation == "delta":
         own_rate_coefficient += 1.0  # implied level coefficient
     return {
         "Stage": stage,
         "Stat": stat,
+        "Feature_Set": feature_set,
         "Formulation": formulation,
         "Alpha": alpha,
         "Own_Rate_Raw_Coefficient": own_rate_coefficient,
+        "Hist_Rate_Raw_Coefficient": (
+            float(raw[1]) if feature_set == "history" else np.nan
+        ),
     }
 
 
@@ -250,11 +327,13 @@ def build_bundle(
         policy = str(decision["selected_policy"])
         if policy in MODEL_FORMULATIONS:
             alpha = float(decision["tuned_alpha"])
-            models[stat] = fit_stat_model(train, stat, alpha, policy)
+            feature_set = str(decision["tuned_feature_set"])
+            models[stat] = fit_stat_model(train, stat, alpha, policy, feature_set)
             settings[stat] = {
                 "formulation": policy,
                 "alpha": alpha,
-                "features": FEATURES_BY_STAT[stat],
+                "feature_set": feature_set,
+                "features": features_for(stat, feature_set),
             }
         elif policy == "naive_prior":
             settings[stat] = {"formulation": "prior", "alpha": None, "features": []}
@@ -287,7 +366,7 @@ def build_bundle(
             )
             for stat in TARGET_STATS
         },
-        "sample_weight_formula": SAMPLE_WEIGHT_FORMULA,
+        "weight_normalization": WEIGHT_NORMALIZATION,
         "fit_transition_years": sorted(
             int(year) for year in train["YEAR_NEXT"].unique()
         ),
@@ -295,7 +374,12 @@ def build_bundle(
 
 
 def predict_rates(bundle: dict[str, object], data: pd.DataFrame) -> pd.DataFrame:
-    """Apply persisted model, prior, shrinkage, and component-derived policies."""
+    """Apply persisted model, prior, shrinkage, and component-derived policies.
+
+    `data` needs the base columns ([STAT]_RATE_prior, AGE_prior, AGE_SQ,
+    MIN_prior) and, if any selected model uses the history feature set,
+    [STAT]_RATE_hist, HIST_MIN and HIST_SEASONS.
+    """
     models = bundle["models"]
     settings_by_stat = bundle["settings_by_stat"]
     references = bundle["prior_shrinkage_reference_by_stat"]
@@ -307,7 +391,13 @@ def predict_rates(bundle: dict[str, object], data: pd.DataFrame) -> pd.DataFrame
         if formulation in MODEL_FORMULATIONS:
             if stat not in models:
                 raise ValueError(f"Persisted model missing for {stat}.")
-            prediction = predict_stat_model(models[stat], data, stat, formulation)
+            prediction = predict_stat_model(
+                models[stat],
+                data,
+                stat,
+                formulation,
+                str(settings.get("feature_set", "base")),
+            )
         elif formulation == "prior":
             prediction = prior
         elif formulation == "prior_shrinkage":
@@ -447,32 +537,39 @@ def _paired_bootstrap(
 def tune_rate_models(
     folds: list[tuple[int, pd.DataFrame, pd.DataFrame]],
 ) -> tuple[pd.DataFrame, dict[str, dict[str, float | str]]]:
-    """Evaluate every formulation/alpha on each fold and pick one per stat.
+    """Evaluate every feature set/formulation/alpha on each fold; pick one per stat.
 
     Selection minimizes mean debiased MAE across folds, then maximizes mean
-    Spearman, then prefers "level" over "delta", then the smaller alpha.
+    Spearman, then prefers the simpler options: "base" over "history", "level"
+    over "delta", then the smaller alpha.
     """
     records = []
     for validation_year, train, validation in folds:
         for stat in TARGET_STATS:
-            for formulation in MODEL_FORMULATIONS:
-                for alpha in ALPHA_GRID:
-                    model = fit_stat_model(train, stat, alpha, formulation)
-                    prediction = predict_stat_model(
-                        model, validation, stat, formulation
-                    )
-                    records.append(
-                        {
-                            "Validation_Year": validation_year,
-                            "Stat": stat,
-                            "Formulation": formulation,
-                            "Alpha": alpha,
-                            **_score_predictions(train, validation, stat, prediction),
-                        }
-                    )
+            for feature_set in FEATURE_SETS:
+                for formulation in MODEL_FORMULATIONS:
+                    for alpha in ALPHA_GRID:
+                        model = fit_stat_model(
+                            train, stat, alpha, formulation, feature_set
+                        )
+                        prediction = predict_stat_model(
+                            model, validation, stat, formulation, feature_set
+                        )
+                        records.append(
+                            {
+                                "Validation_Year": validation_year,
+                                "Stat": stat,
+                                "Feature_Set": feature_set,
+                                "Formulation": formulation,
+                                "Alpha": alpha,
+                                **_score_predictions(
+                                    train, validation, stat, prediction
+                                ),
+                            }
+                        )
 
     grid = pd.DataFrame(records)
-    keys = ["Stat", "Formulation", "Alpha"]
+    keys = ["Stat", "Feature_Set", "Formulation", "Alpha"]
     mean_scores = grid.groupby(keys, as_index=False).agg(
         Mean_Debiased_MAE=("Model_Debiased_MAE", "mean"),
         Mean_Spearman=("Model_Spearman", "mean"),
@@ -481,21 +578,31 @@ def tune_rate_models(
     grid = grid.merge(mean_scores, on=keys, how="left", validate="many_to_one")
 
     ranked = mean_scores.assign(
+        Feature_Priority=mean_scores["Feature_Set"].map(
+            {name: index for index, name in enumerate(FEATURE_SETS)}
+        ),
         Formulation_Priority=mean_scores["Formulation"].map(
             {"level": 0, "delta": 1}
-        )
+        ),
     )
     selections: dict[str, dict[str, float | str]] = {}
     for stat in TARGET_STATS:
         best = (
             ranked.loc[ranked["Stat"] == stat]
             .sort_values(
-                ["Mean_Debiased_MAE", "Mean_Spearman", "Formulation_Priority", "Alpha"],
-                ascending=[True, False, True, True],
+                [
+                    "Mean_Debiased_MAE",
+                    "Mean_Spearman",
+                    "Feature_Priority",
+                    "Formulation_Priority",
+                    "Alpha",
+                ],
+                ascending=[True, False, True, True, True],
             )
             .iloc[0]
         )
         selections[stat] = {
+            "feature_set": str(best["Feature_Set"]),
             "formulation": str(best["Formulation"]),
             "alpha": float(best["Alpha"]),
         }
@@ -518,6 +625,7 @@ def decide_policy(
     Otherwise: FTM/FTA -> prior shrinkage, PTS -> component-derived,
     everything else -> naive prior.
     """
+    feature_set = str(choice["feature_set"])
     formulation = str(choice["formulation"])
     alpha = float(choice["alpha"])
     bootstrap_records: list[dict[str, object]] = []
@@ -532,8 +640,10 @@ def decide_policy(
     }
 
     for fold_index, (year, train, validation) in enumerate(folds):
-        model = fit_stat_model(train, stat, alpha, formulation)
-        prediction = predict_stat_model(model, validation, stat, formulation)
+        model = fit_stat_model(train, stat, alpha, formulation, feature_set)
+        prediction = predict_stat_model(
+            model, validation, stat, formulation, feature_set
+        )
         predictions[year] = prediction
         actual = validation[f"{stat}_RATE_target"].to_numpy(dtype=float)
         naive = validation[f"{stat}_RATE_prior"].to_numpy(dtype=float)
@@ -552,6 +662,7 @@ def decide_policy(
                 "Scope": "fold",
                 "Validation_Year": year,
                 "Stat": stat,
+                "Feature_Set": feature_set,
                 "Formulation": formulation,
                 "Alpha": alpha,
                 "Compared_To": "naive_prior",
@@ -567,6 +678,7 @@ def decide_policy(
                 "Evaluation_Set": "tuned_candidate",
                 "Validation_Year": year,
                 "Stat": stat,
+                "Feature_Set": feature_set,
                 "Formulation": formulation,
                 "Alpha": alpha,
                 **_score_predictions(train, validation, stat, prediction),
@@ -589,6 +701,7 @@ def decide_policy(
             "Scope": "pooled",
             "Validation_Year": None,
             "Stat": stat,
+            "Feature_Set": feature_set,
             "Formulation": formulation,
             "Alpha": alpha,
             "Compared_To": "naive_prior",
@@ -621,6 +734,7 @@ def decide_policy(
 
     return {
         "decision": {
+            "tuned_feature_set": feature_set,
             "tuned_formulation": formulation,
             "tuned_alpha": alpha,
             "accepted": accepted,
@@ -648,6 +762,7 @@ def decisions_to_frame(decisions: dict[str, dict[str, object]]) -> pd.DataFrame:
         row: dict[str, object] = {
             "Stat": stat,
             "Selected_Policy": decision["selected_policy"],
+            "Tuned_Feature_Set": decision["tuned_feature_set"],
             "Tuned_Formulation": decision["tuned_formulation"],
             "Tuned_Alpha": decision["tuned_alpha"],
             "Accepted": decision["accepted"],
@@ -829,7 +944,7 @@ def run_phase_four(pairs: pd.DataFrame) -> dict[str, object]:
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     folds = rolling_origin_folds(pairs)
 
-    # 1. Tune formulation and alpha per stat.
+    # 1. Tune feature set, formulation and alpha per stat.
     grid, selections = tune_rate_models(folds)
     grid.to_csv(ALPHA_GRID_METRICS_PATH, index=False)
 
@@ -858,17 +973,17 @@ def run_phase_four(pairs: pd.DataFrame) -> dict[str, object]:
         policy_predictions[year] = predictions
         for stat in TARGET_STATS:
             policy = str(decisions[stat]["selected_policy"])
+            is_model = policy in MODEL_FORMULATIONS
             fold_metric_records.append(
                 {
                     "Evaluation_Set": "selected_policy",
                     "Validation_Year": year,
                     "Stat": stat,
-                    "Formulation": policy,
-                    "Alpha": (
-                        decisions[stat]["tuned_alpha"]
-                        if policy in MODEL_FORMULATIONS
-                        else np.nan
+                    "Feature_Set": (
+                        decisions[stat]["tuned_feature_set"] if is_model else None
                     ),
+                    "Formulation": policy,
+                    "Alpha": decisions[stat]["tuned_alpha"] if is_model else np.nan,
                     **_score_predictions(
                         train,
                         validation,
@@ -890,31 +1005,43 @@ def run_phase_four(pairs: pd.DataFrame) -> dict[str, object]:
             _top_quartile_records(stat, folds, candidate_predictions, policy_predictions)
         )
 
-    # 4. Refit on all transitions and persist.
+    # 4. Refit on the training window and persist.
+    final_train = _train_slice(pairs, int(pairs["YEAR_NEXT"].max()) + 1)
     coefficients = []
     candidate_models: dict[str, Pipeline] = {}
     candidate_settings: dict[str, dict[str, object]] = {}
     for stat in TARGET_STATS:
         decision = decisions[stat]
+        feature_set = str(decision["tuned_feature_set"])
         formulation = str(decision["tuned_formulation"])
         alpha = float(decision["tuned_alpha"])
-        candidate_models[stat] = fit_stat_model(pairs, stat, alpha, formulation)
+        candidate_models[stat] = fit_stat_model(
+            final_train, stat, alpha, formulation, feature_set
+        )
         candidate_settings[stat] = {
+            "feature_set": feature_set,
             "formulation": formulation,
             "alpha": alpha,
-            "features": FEATURES_BY_STAT[stat],
+            "features": features_for(stat, feature_set),
         }
         coefficients.append(
             _coefficient_record(
-                candidate_models[stat], stat, formulation, alpha, "full_data_candidate"
+                candidate_models[stat],
+                stat,
+                formulation,
+                alpha,
+                "full_data_candidate",
+                feature_set,
             )
         )
 
-    bundle = build_bundle(pairs, decisions)
+    bundle = build_bundle(final_train, decisions)
     bundle["candidate_models"] = candidate_models
     bundle["candidate_settings_by_stat"] = candidate_settings
     bundle["fold_validation_years"] = [year for year, _, _ in folds]
     bundle["alpha_grid"] = ALPHA_GRID
+    bundle["feature_sets"] = FEATURE_SETS
+    bundle["train_window_years"] = TRAIN_WINDOW_YEARS
     bundle["ranking_minutes_threshold"] = RANKING_MINUTES_THRESHOLD
 
     fold_metrics = pd.DataFrame(fold_metric_records)
@@ -940,6 +1067,7 @@ def run_phase_four(pairs: pd.DataFrame) -> dict[str, object]:
 
     metadata = {
         "target_stats": TARGET_STATS,
+        "feature_sets": FEATURE_SETS,
         "features_by_stat": FEATURES_BY_STAT,
         "settings_by_stat": bundle["settings_by_stat"],
         "candidate_settings_by_stat": candidate_settings,
@@ -961,10 +1089,11 @@ def run_phase_four(pairs: pd.DataFrame) -> dict[str, object]:
             }
             for year, train, validation in folds
         ],
-        "full_training_rows": len(pairs),
+        "full_training_rows": len(final_train),
         "fit_transition_years": bundle["fit_transition_years"],
+        "train_window_years": TRAIN_WINDOW_YEARS,
         "alpha_grid": ALPHA_GRID,
-        "sample_weight_formula": SAMPLE_WEIGHT_FORMULA,
+        "weight_normalization": WEIGHT_NORMALIZATION,
         "ranking_minutes_threshold": RANKING_MINUTES_THRESHOLD,
         "bootstrap_iterations": BOOTSTRAP_ITERATIONS,
         "bootstrap_seed": BOOTSTRAP_SEED,
@@ -1007,6 +1136,22 @@ def print_summary(results: dict[str, object]) -> None:
         ).reindex(TARGET_STATS)
         print(f"\nImprovement vs naive (%), {evaluation_set}:")
         print(pivot.round(2).to_string())
+
+    grid = results["grid"]
+    best_by_feature_set = (
+        grid.groupby(["Stat", "Feature_Set"])["Mean_Debiased_MAE"]
+        .min()
+        .unstack("Feature_Set")
+        .reindex(TARGET_STATS)
+    )
+    if {"base", "history"} <= set(best_by_feature_set.columns):
+        best_by_feature_set["History_vs_Base_pct"] = (
+            100
+            * (best_by_feature_set["base"] - best_by_feature_set["history"])
+            / best_by_feature_set["base"]
+        )
+    print("\nBest mean debiased MAE per feature set (positive % = history better):")
+    print(best_by_feature_set.round(5).to_string())
 
     print("\nImplied FG% / FT% (policy vs naive vs actual):")
     print(results["percentage_diagnostics"].round(4).to_string(index=False))

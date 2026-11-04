@@ -25,6 +25,9 @@ COUNTING_STATS = [
 ]
 RATE_COLUMNS = {stat: f"{stat}_RATE" for stat in COUNTING_STATS}
 MINIMUM_SEASON_MINUTES = 200
+# False = keep every player in the cache (retired players too) so training does
+# not only see players who are still in the league. Needs the full ingest cache.
+RESTRICT_TO_CURRENT_ROSTER = False
 
 
 def prepare_training_data(
@@ -85,7 +88,7 @@ def prepare_training_data(
 			f"resolution. Expected one team entry; examples: {examples}"
 		)
 
-	if CURRENT_ROSTERS_PATH.exists():
+	if RESTRICT_TO_CURRENT_ROSTER and CURRENT_ROSTERS_PATH.exists():
 		current_rosters = pd.read_csv(CURRENT_ROSTERS_PATH)
 		if "PLAYER_ID" not in current_rosters.columns:
 			raise ValueError(

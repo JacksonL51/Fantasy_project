@@ -1,0 +1,466 @@
+"""Shared multi-season player history utilities.
+
+Used by model.py (training features) and project.py (inference features and
+the minutes / games baselines) so identical numbers are computed in both
+places. This module has no dependency on model.py.
+
+Two kinds of history are built here:
+
+1. Rate history (`compute_history_features`): for every player-season t, a
+   recency- and minutes-weighted average of that player's per-minute rates
+   over the seasons ending at t, plus how many minutes / seasons back it.
+   It only looks at seasons <= t, so it is safe to use as a training feature
+   for the t -> t+1 transition.
+
+2. Playing-time baselines (`player_baselines`): a recency-weighted active MPG
+   and the raw games-played history for the last few completed seasons.
+"""
+
+import numpy as np
+import pandas as pd
+
+# Rate-history features
+HISTORY_WINDOW_YEARS = 3  # seasons ending at t that feed the history features
+HISTORY_DECAY = 0.7  # weight multiplier per year back (1.0, 0.7, 0.49)
+
+# Playing-time baselines
+BASELINE_WEIGHTS = (0.60, 0.27, 0.13)  # most recent completed season first
+MIN_GP_FOR_STABLE_MPG = 20  # seasons with fewer games are ignored for MPG
+
+
+def season_year(series: pd.Series) -> pd.Series:
+    """Integer season year. "2025-26" -> 2026; a bare number is used as is."""
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.notna().all():
+        return numeric.astype("int64")
+    start = pd.to_numeric(
+        series.astype(str).str.extract(r"(\d{4})")[0], errors="coerce"
+    )
+    if start.isna().any():
+        raise ValueError("Could not parse every SEASON value into a year.")
+    return (start + 1).astype("int64")
+
+
+def history_feature_columns(stats: list[str]) -> list[str]:
+    return [f"{stat}_RATE_hist" for stat in stats] + ["HIST_MIN", "HIST_SEASONS"]
+
+
+def load_history(path, stats: list[str]) -> pd.DataFrame:
+    """One row per player per season with valid minutes, games and rates."""
+    history = pd.read_csv(path)
+    rate_columns = [f"{stat}_RATE" for stat in stats]
+    required = ["PLAYER_ID", "SEASON", "AGE", "GP", "MIN", *rate_columns]
+    missing = [column for column in required if column not in history.columns]
+    if missing:
+        raise ValueError("training_data.csv is missing columns: " + ", ".join(missing))
+
+    history["SEASON_YEAR"] = season_year(history["SEASON"])
+    for column in ["PLAYER_ID", "AGE", "GP", "MIN", *rate_columns]:
+        history[column] = pd.to_numeric(history[column], errors="coerce")
+    valid = (
+        history["PLAYER_ID"].notna()
+        & (history["MIN"] > 0)
+        & (history["GP"] > 0)
+        & np.isfinite(history[rate_columns].to_numpy(dtype=float)).all(axis=1)
+    )
+    history = history.loc[valid].copy()
+    history["PLAYER_ID"] = history["PLAYER_ID"].astype("int64")
+    if "PLAYER_NAME" not in history.columns:
+        history["PLAYER_NAME"] = pd.NA
+    return (
+        history.sort_values(["PLAYER_ID", "SEASON_YEAR"])
+        .drop_duplicates(["PLAYER_ID", "SEASON_YEAR"], keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def compute_history_features(
+    history: pd.DataFrame,
+    stats: list[str],
+    window_years: int = HISTORY_WINDOW_YEARS,
+    decay: float = HISTORY_DECAY,
+) -> pd.DataFrame:
+    """Rolling multi-season rate features, one row per (PLAYER_ID, SEASON_YEAR).
+
+    For season t the feature is the average of each rate over seasons
+    t, t-1, ..., t-(window_years-1), weighted by decay**years_back * MINUTES,
+    so recent seasons and bigger samples count more. Later seasons are never
+    used. HIST_MIN is the unweighted minutes in the window and HIST_SEASONS the
+    number of seasons found in it (calendar gaps simply shrink the window).
+    """
+    rate_columns = [f"{stat}_RATE" for stat in stats]
+    ordered = history.sort_values(["PLAYER_ID", "SEASON_YEAR"])
+    ids, season_years, rate_rows, minute_totals, season_counts = [], [], [], [], []
+    for player_id, group in ordered.groupby("PLAYER_ID", sort=False):
+        years = group["SEASON_YEAR"].to_numpy()
+        minutes = group["MIN"].to_numpy(dtype=float)
+        rates = group[rate_columns].to_numpy(dtype=float)
+        for i in range(len(group)):
+            years_back = years[i] - years[: i + 1]
+            keep = years_back < window_years
+            weight = (decay ** years_back[keep]) * minutes[: i + 1][keep]
+            rate_rows.append(
+                (rates[: i + 1][keep] * weight[:, None]).sum(axis=0) / weight.sum()
+            )
+            ids.append(player_id)
+            season_years.append(years[i])
+            minute_totals.append(minutes[: i + 1][keep].sum())
+            season_counts.append(int(keep.sum()))
+
+    features = pd.DataFrame(
+        np.vstack(rate_rows), columns=[f"{stat}_RATE_hist" for stat in stats]
+    )
+    features.insert(0, "SEASON_YEAR", np.asarray(season_years, dtype="int64"))
+    features.insert(0, "PLAYER_ID", np.asarray(ids, dtype="int64"))
+    features["HIST_MIN"] = minute_totals
+    features["HIST_SEASONS"] = season_counts
+    return features
+
+
+def _weighted_nan_mean(frame: pd.DataFrame, weights) -> pd.Series:
+    """Row-wise weighted mean that skips NaN cells (weights renormalized)."""
+    values = frame.to_numpy(dtype=float)
+    valid = ~np.isnan(values)
+    cell_weights = np.where(valid, np.asarray(weights, dtype=float)[None, :], 0.0)
+    denominator = cell_weights.sum(axis=1)
+    numerator = (np.where(valid, values, 0.0) * cell_weights).sum(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        result = numerator / denominator
+    return pd.Series(np.where(denominator > 0, result, np.nan), index=frame.index)
+
+
+def player_baselines(
+    history: pd.DataFrame,
+    latest_year: int,
+    weights=BASELINE_WEIGHTS,
+    min_gp: int = MIN_GP_FOR_STABLE_MPG,
+) -> pd.DataFrame:
+    """Playing-time baselines over the last completed seasons, one row per player.
+
+    Active MPG (MIN / GP) is averaged with recency weights over seasons with
+    at least `min_gp` games; if a player has none in the window, the most
+    recent season is used and MPG_FALLBACK is set.
+
+    Games played are tracked per calendar season of the window. A season the
+    player missed entirely counts as 0 games if he was already in the league
+    (first season <= that year); seasons before his debut are not counted.
+    """
+    window = len(weights)
+    first_year = history.groupby("PLAYER_ID")["SEASON_YEAR"].min()
+    players = first_year.index
+    gp_wide = history.pivot(index="PLAYER_ID", columns="SEASON_YEAR", values="GP")
+    min_wide = history.pivot(index="PLAYER_ID", columns="SEASON_YEAR", values="MIN")
+
+    gp_columns, mpg_columns = {}, {}
+    empty = pd.Series(np.nan, index=players)
+    for k in range(window):
+        year = latest_year - k
+        gp_k = gp_wide[year].reindex(players) if year in gp_wide.columns else empty
+        min_k = min_wide[year].reindex(players) if year in min_wide.columns else empty
+        in_league = first_year <= year
+        gp_columns[k] = gp_k.fillna(0.0).where(in_league)
+        mpg_columns[k] = (min_k / gp_k).where(gp_k >= min_gp)
+    gp_frame = pd.DataFrame(gp_columns)
+    mpg_frame = pd.DataFrame(mpg_columns)
+
+    last_row = history.groupby("PLAYER_ID").tail(1).set_index("PLAYER_ID")
+    last_mpg = (last_row["MIN"] / last_row["GP"]).reindex(players)
+    weighted_mpg = _weighted_nan_mean(mpg_frame, weights)
+    fallback = weighted_mpg.isna()
+
+    return pd.DataFrame(
+        {
+            "PLAYER_ID": players.to_numpy(),
+            "BASE_MPG": weighted_mpg.fillna(last_mpg).to_numpy(),
+            "MPG_SEASONS_USED": mpg_frame.notna().sum(axis=1).to_numpy(),
+            "MPG_FALLBACK": fallback.to_numpy(),
+            "GP_WEIGHTED": _weighted_nan_mean(gp_frame, weights).to_numpy(),
+            "GP_MEDIAN": gp_frame.median(axis=1).to_numpy(),
+            "GP_MAX": gp_frame.max(axis=1).to_numpy(),
+            "GP_SEASONS_COUNTED": gp_frame.notna().sum(axis=1).to_numpy(),
+            "FIRST_SEASON": first_year.to_numpy(),
+        }
+    )
+
+
+# --------------------------------------------------------------------------
+# Age effect on playing time
+# --------------------------------------------------------------------------
+AGE_CURVE_MIN_GP = 40  # both seasons need this many games to enter the fit
+AGE_CURVE_MIN_PAIRS = 300  # fewer transitions than this -> no adjustment
+AGE_CURVE_SHRINK = 0.5  # fraction of the fitted change that is applied
+AGE_CURVE_CLIP = 2.5  # max +/- MPG adjustment
+
+
+def fit_age_mpg_curve(history: pd.DataFrame, min_gp: int = AGE_CURVE_MIN_GP) -> dict:
+    """Expected next-season change in active MPG, from age and current MPG.
+
+    Least squares on consecutive-season pairs (both seasons with >= min_gp
+    games): delta = b0 + b1*a + b2*a^2 + b3*m with a = age - 26 and
+    m = MPG - 20. The MPG term captures regression to the mean in minutes, so
+    the age terms are not confused with it. Pass a history that already ends at
+    the last season you may use (the backtest does this to avoid leakage).
+    """
+    h = history.loc[history["GP"] >= min_gp, ["PLAYER_ID", "SEASON_YEAR", "AGE", "GP", "MIN"]]
+    h = h.assign(MPG=h["MIN"] / h["GP"])
+    nxt = h[["PLAYER_ID", "SEASON_YEAR", "MPG"]].copy()
+    nxt["SEASON_YEAR"] -= 1
+    pairs = h.merge(nxt, on=["PLAYER_ID", "SEASON_YEAR"], suffixes=("", "_NEXT"))
+    pairs = pairs.dropna(subset=["AGE", "MPG", "MPG_NEXT"])
+    if len(pairs) < AGE_CURVE_MIN_PAIRS:
+        return {"kind": "age", "coef": [0.0, 0.0, 0.0, 0.0], "pairs": int(len(pairs)), "active": False}
+    a = pairs["AGE"].to_numpy(dtype=float) - 26.0
+    m = pairs["MPG"].to_numpy(dtype=float) - 20.0
+    design = np.column_stack([np.ones(len(a)), a, a**2, m])
+    delta = (pairs["MPG_NEXT"] - pairs["MPG"]).to_numpy(dtype=float)
+    coef, *_ = np.linalg.lstsq(design, delta, rcond=None)
+    return {"kind": "age", "coef": [round(float(c), 5) for c in coef], "pairs": int(len(pairs)), "active": True}
+
+
+def age_mpg_adjustment(curve: dict, age: pd.Series, mpg: pd.Series) -> pd.Series:
+    """Shrunk, clipped expected MPG change for each player (0 if curve inactive)."""
+    if not curve.get("active", False):
+        return pd.Series(0.0, index=age.index)
+    b0, b1, b2, b3 = curve["coef"]
+    a = pd.to_numeric(age, errors="coerce") - 26.0
+    m = mpg - 20.0
+    predicted = b0 + b1 * a + b2 * a**2 + b3 * m
+    return (AGE_CURVE_SHRINK * predicted).clip(-AGE_CURVE_CLIP, AGE_CURVE_CLIP).fillna(0.0)
+
+
+# --------------------------------------------------------------------------
+# Production score, role (rotation-change) curve, fitted games model
+# --------------------------------------------------------------------------
+PROD_POOL_MINUTES = 500.0  # players with at least this many minutes set the scale
+PROD_SHRINK_MINUTES = 400.0  # score is multiplied by MIN / (MIN + this)
+ROLE_WEIGHTS = (0.60, 0.27, 0.13)  # must match project.py's RECENCY_WEIGHTS
+ROLE_BASELINE_MIN_GP = 15  # must match project.py's BASELINE_ACTIVE_MPG rule
+ROLE_CURVE_MIN_GP = 20  # next season needs this many games to count
+ROLE_CURVE_MIN_PAIRS = 300
+ROLE_SHRINK = 0.5  # fraction of the fitted MPG change that is applied
+ROLE_CLIP = 3.0  # max +/- MPG adjustment
+ROLE_LOW_MPG = 22.0  # production matters most below this baseline MPG
+GAMES_RIDGE_ALPHA = 10.0
+GAMES_MIN_NEXT_MINUTES = 200.0  # next-season minutes needed to enter the fit
+GAMES_BOUNDS = (15.0, 78.0)
+GAMES_FEATURES = [
+    "GF_LAST", "GF_W", "GF_MIN", "GF_MAX", "GF_N", "BASE_MPG", "AGE", "AGE_SQ",
+]
+
+
+def season_production_z(history: pd.DataFrame) -> pd.DataFrame:
+    """Per-minute 9-category production score for every player-season.
+
+    Within each season, players with >= 500 minutes define the mean and spread
+    of seven per-minute counting rates (turnovers negated) plus FG and FT
+    efficiency impact per minute (made minus league percentage times attempts).
+    The score is the average z-score, shrunk toward 0 by MIN / (MIN + 400) so
+    tiny samples cannot look like stars. Only the same season's data is used.
+    """
+    rows = []
+    for year, group in history.groupby("SEASON_YEAR"):
+        pool = group.loc[group["MIN"] >= PROD_POOL_MINUTES]
+        if len(pool) < 30:
+            rows.append(
+                pd.DataFrame(
+                    {"PLAYER_ID": group["PLAYER_ID"], "SEASON_YEAR": year, "PROD_Z": 0.0}
+                )
+            )
+            continue
+        fg = (pool["FGM_RATE"] * pool["MIN"]).sum() / (pool["FGA_RATE"] * pool["MIN"]).sum()
+        ft = (pool["FTM_RATE"] * pool["MIN"]).sum() / (pool["FTA_RATE"] * pool["MIN"]).sum()
+
+        def components(frame: pd.DataFrame) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "PTS": frame["PTS_RATE"], "FG3M": frame["FG3M_RATE"],
+                    "REB": frame["REB_RATE"], "AST": frame["AST_RATE"],
+                    "STL": frame["STL_RATE"], "BLK": frame["BLK_RATE"],
+                    "TOV": -frame["TOV_RATE"],
+                    "FG": frame["FGM_RATE"] - fg * frame["FGA_RATE"],
+                    "FT": frame["FTM_RATE"] - ft * frame["FTA_RATE"],
+                }
+            )
+
+        reference = components(pool)
+        spread = reference.std(ddof=0).replace(0.0, 1.0)
+        z = ((components(group) - reference.mean()) / spread).mean(axis=1)
+        shrink = group["MIN"] / (group["MIN"] + PROD_SHRINK_MINUTES)
+        rows.append(
+            pd.DataFrame(
+                {"PLAYER_ID": group["PLAYER_ID"].to_numpy(), "SEASON_YEAR": year,
+                 "PROD_Z": (z * shrink).to_numpy()}
+            )
+        )
+    return pd.concat(rows, ignore_index=True)
+
+
+def _wide(history: pd.DataFrame, values: pd.Series) -> pd.DataFrame:
+    """Players x consecutive calendar years (NaN where a season is missing)."""
+    frame = pd.DataFrame(
+        {"PLAYER_ID": history["PLAYER_ID"].to_numpy(),
+         "SEASON_YEAR": history["SEASON_YEAR"].to_numpy(),
+         "V": values.to_numpy(dtype=float)}
+    ).pivot(index="PLAYER_ID", columns="SEASON_YEAR", values="V")
+    years = range(int(frame.columns.min()), int(frame.columns.max()) + 1)
+    return frame.reindex(columns=list(years))
+
+
+def role_feature_table(history: pd.DataFrame) -> pd.DataFrame:
+    """Per (PLAYER_ID, SEASON_YEAR t): BASE_MPG as of t, AGE and PROD_Z.
+
+    BASE_MPG is the 60/27/13 recency-weighted active MPG over seasons t, t-1,
+    t-2 that have >= 15 games, using only seasons <= t (same rule as
+    project.py's BASELINE_ACTIVE_MPG for a player whose latest season is t).
+    """
+    mpg = (history["MIN"] / history["GP"]).where(history["GP"] >= ROLE_BASELINE_MIN_GP)
+    wide = _wide(history, mpg)
+    numerator = pd.DataFrame(0.0, index=wide.index, columns=wide.columns)
+    denominator = numerator.copy()
+    for lag, weight in enumerate(ROLE_WEIGHTS):
+        shifted = wide.shift(lag, axis=1)
+        numerator += shifted.fillna(0.0) * weight
+        denominator += shifted.notna() * weight
+    base = (numerator / denominator.where(denominator > 0)).stack().rename("BASE_MPG")
+    base = base.reset_index()
+    out = history[["PLAYER_ID", "SEASON_YEAR", "AGE"]].merge(
+        base, on=["PLAYER_ID", "SEASON_YEAR"], how="left", validate="one_to_one"
+    )
+    return out.merge(
+        season_production_z(history), on=["PLAYER_ID", "SEASON_YEAR"],
+        how="left", validate="one_to_one",
+    )
+
+
+def _role_design(age, base_mpg, prod) -> np.ndarray:
+    a = np.asarray(age, dtype=float) - 26.0
+    m = np.asarray(base_mpg, dtype=float) - 20.0
+    p = np.asarray(prod, dtype=float)
+    low = np.maximum(0.0, ROLE_LOW_MPG - np.asarray(base_mpg, dtype=float)) / 10.0
+    return np.column_stack([np.ones(len(a)), a, a**2, m, m**2, p, p * low])
+
+
+def fit_role_curve(history: pd.DataFrame) -> dict:
+    """Expected next-season MPG change from age, baseline MPG and production.
+
+    Least squares over consecutive-season pairs where next season has >= 20
+    games: next MPG minus baseline MPG on age, age^2, MPG, MPG^2, production
+    score, and production x how far the baseline is below 22 MPG. Pass a
+    history that already ends at the last season you may use.
+    """
+    features = role_feature_table(history)
+    following = history.loc[
+        history["GP"] >= ROLE_CURVE_MIN_GP, ["PLAYER_ID", "SEASON_YEAR", "GP", "MIN"]
+    ].copy()
+    following["MPG_NEXT"] = following["MIN"] / following["GP"]
+    following["SEASON_YEAR"] -= 1
+    pairs = features.merge(
+        following[["PLAYER_ID", "SEASON_YEAR", "MPG_NEXT"]],
+        on=["PLAYER_ID", "SEASON_YEAR"],
+    ).dropna(subset=["AGE", "BASE_MPG", "PROD_Z", "MPG_NEXT"])
+    if len(pairs) < ROLE_CURVE_MIN_PAIRS:
+        return {"kind": "role", "coef": [0.0] * 7, "pairs": int(len(pairs)), "active": False}
+    design = _role_design(pairs["AGE"], pairs["BASE_MPG"], pairs["PROD_Z"])
+    target = (pairs["MPG_NEXT"] - pairs["BASE_MPG"]).to_numpy(dtype=float)
+    coef, *_ = np.linalg.lstsq(design, target, rcond=None)
+    return {"kind": "role", "coef": [round(float(c), 5) for c in coef],
+            "pairs": int(len(pairs)), "active": True}
+
+
+def role_mpg_adjustment(curve: dict, age: pd.Series, mpg: pd.Series, prod: pd.Series) -> pd.Series:
+    """Shrunk, clipped expected MPG change; 0 if the curve is inactive."""
+    if not curve.get("active", False):
+        return pd.Series(0.0, index=age.index)
+    design = _role_design(
+        pd.to_numeric(age, errors="coerce").fillna(26.0), mpg, prod.fillna(0.0)
+    )
+    predicted = pd.Series(design @ np.asarray(curve["coef"], dtype=float), index=age.index)
+    return (ROLE_SHRINK * predicted).clip(-ROLE_CLIP, ROLE_CLIP).fillna(0.0)
+
+
+def games_feature_table(history: pd.DataFrame) -> pd.DataFrame:
+    """Games-played features per (PLAYER_ID, SEASON_YEAR t), seasons <= t only.
+
+    GF_LAST = games in t; GF_W = recency-weighted mean of games over seasons
+    t, t-1, t-2 that exist; GF_MIN / GF_MAX = lowest / highest of those;
+    GF_N = how many of the three exist.
+    """
+    wide = _wide(history, history["GP"])
+    stack = np.stack([wide.shift(lag, axis=1).to_numpy() for lag in range(3)])
+    weights = np.asarray(ROLE_WEIGHTS)[:, None, None]
+    valid = ~np.isnan(stack)
+    weight_sum = (weights * valid).sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        weighted = (np.where(valid, stack, 0.0) * weights).sum(axis=0) / weight_sum
+        lowest = np.where(valid, stack, np.inf).min(axis=0)
+        highest = np.where(valid, stack, -np.inf).max(axis=0)
+    table = pd.DataFrame(
+        {
+            "GF_LAST": wide.to_numpy().ravel(),
+            "GF_W": weighted.ravel(),
+            "GF_MIN": lowest.ravel(),
+            "GF_MAX": highest.ravel(),
+            "GF_N": valid.sum(axis=0).ravel(),
+        },
+        index=pd.MultiIndex.from_product(
+            [wide.index, wide.columns], names=["PLAYER_ID", "SEASON_YEAR"]
+        ),
+    )
+    return table.dropna(subset=["GF_LAST"]).reset_index()
+
+
+def _games_matrix(frame: pd.DataFrame) -> np.ndarray:
+    age = pd.to_numeric(frame["AGE"], errors="coerce").fillna(26.0).to_numpy(dtype=float)
+    columns = []
+    for name in GAMES_FEATURES:
+        if name == "AGE":
+            columns.append(age)
+        elif name == "AGE_SQ":
+            columns.append(age**2)
+        else:
+            columns.append(frame[name].to_numpy(dtype=float))
+    return np.column_stack(columns)
+
+
+def fit_games_model(history: pd.DataFrame, alpha: float = GAMES_RIDGE_ALPHA) -> dict:
+    """Ridge regression of next-season games on games history, role and age.
+
+    Pairs are (season t features) -> games in t+1, where the player had >= 200
+    minutes in t+1 (the same population the projections are scored on).
+    """
+    features = games_feature_table(history).merge(
+        role_feature_table(history)[["PLAYER_ID", "SEASON_YEAR", "AGE", "BASE_MPG"]],
+        on=["PLAYER_ID", "SEASON_YEAR"], how="left", validate="one_to_one",
+    )
+    last = history[["PLAYER_ID", "SEASON_YEAR", "GP", "MIN"]]
+    features = features.merge(last, on=["PLAYER_ID", "SEASON_YEAR"], how="left")
+    features["BASE_MPG"] = features["BASE_MPG"].fillna(features["MIN"] / features["GP"])
+    following = history.loc[
+        history["MIN"] >= GAMES_MIN_NEXT_MINUTES, ["PLAYER_ID", "SEASON_YEAR", "GP"]
+    ].rename(columns={"GP": "GP_NEXT"})
+    following["SEASON_YEAR"] -= 1
+    pairs = features.merge(following, on=["PLAYER_ID", "SEASON_YEAR"]).dropna(
+        subset=GAMES_FEATURES[:-2] + ["GP_NEXT"]
+    )
+    if len(pairs) < 300:
+        return {"active": False, "pairs": int(len(pairs))}
+    design = _games_matrix(pairs)
+    mean, scale = design.mean(axis=0), design.std(axis=0)
+    scale[scale == 0] = 1.0
+    standardized = (design - mean) / scale
+    target = pairs["GP_NEXT"].to_numpy(dtype=float)
+    intercept = float(target.mean())
+    gram = standardized.T @ standardized + alpha * np.eye(standardized.shape[1])
+    coef = np.linalg.solve(gram, standardized.T @ (target - intercept))
+    return {
+        "active": True, "pairs": int(len(pairs)), "intercept": intercept,
+        "mean": mean.tolist(), "scale": scale.tolist(), "coef": coef.tolist(),
+        "features": GAMES_FEATURES,
+    }
+
+
+def predict_games(model: dict, frame: pd.DataFrame) -> pd.Series:
+    """Fitted games, clipped to 15-78. `frame` needs GAMES_FEATURES minus AGE_SQ."""
+    design = (_games_matrix(frame) - np.asarray(model["mean"])) / np.asarray(model["scale"])
+    predicted = model["intercept"] + design @ np.asarray(model["coef"])
+    return pd.Series(np.clip(predicted, *GAMES_BOUNDS), index=frame.index)
