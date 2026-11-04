@@ -80,8 +80,8 @@ on real data recommends the current settings, "fitted" and "age".
 4. Bench per-game lines are allocation leftovers (many pinned at 3 or 24 MPG); do not read
    them closely. Consider limiting rosters to ~15 plus anyone with real minutes.
 5. Optional: manual injury-override file for known long-term injuries.
-6. `data/raw/current_rosters.csv` dates from 2026-09-30; refresh it before relying on
-   projections. `src/export.py` is an empty placeholder.
+6. `src/ingest.py` refreshes `data/raw/current_rosters.csv` on every run (`FETCHED_AT` records
+   the date; a failed fetch keeps the saved file). `src/export.py` is an empty placeholder.
 
 ## Working preferences
 - The user asks for analysis first and wants to approve before building on bigger changes.
