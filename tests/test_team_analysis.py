@@ -11,9 +11,10 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from league_store import MyTeam, load_team, save_team
-from team_analysis import ROSTER_SIZE, analyze_trade, evaluate_team, grade, team_feedback
+from team_analysis import ROSTER_SIZE, analyze_trade, evaluate_team, team_feedback
 
 STATS = ["PTS", "FG3M", "REB", "AST", "STL", "BLK", "TOV", "FGM", "FGA", "FTM", "FTA"]
+CATEGORIES = ["PTS", "FG3M", "REB", "AST", "STL", "BLK", "TOV", "FG", "FT"]
 
 
 def fake_players(count: int = 300) -> pd.DataFrame:
@@ -33,61 +34,48 @@ def fake_players(count: int = 300) -> pd.DataFrame:
                  FGM=550, FGA=1200, FTM=250, FTA=320)
     for stat in STATS:
         frame[f"TOTAL_{stat}"] = bases[stat] * strength * random.uniform(0.85, 1.15, count)
+        frame[f"PROJ_{stat}"] = frame[f"TOTAL_{stat}"] / frame["PROJECTED_GP"]
+    for category in CATEGORIES:
+        frame[f"Z_{category}"] = random.normal(0, 1, count)
     return frame
 
 
-class TeamScores(unittest.TestCase):
+class TeamStats(unittest.TestCase):
     def setUp(self):
         self.players = fake_players()
         self.ids = self.players["PLAYER_ID"].tolist()
+        self.roster = self.ids[:3]
+        self.rows = self.players[self.players["PLAYER_ID"].isin(self.roster)]
 
-    def test_league_average_team_scores_zero_at_every_size(self):
-        # A roster holding the whole typical pool, scaled back down, is exactly typical.
-        for size in (1, 5, ROSTER_SIZE):
-            pool = self.players.head(10 * size)
-            typical = pool.mean(numeric_only=True).to_dict()
-            typical["PLAYER_ID"] = 9999
-            typical["PLAYER_NAME"] = "Typical"
-            players = pd.concat([self.players] + [pd.DataFrame([typical])], ignore_index=True)
-            players.loc[players["PLAYER_ID"] == 9999, "RANK"] = 10_000
-            roster = [9999] * size
-            report = evaluate_team(players, roster, 10)
-            self.assertLess(report.categories["SCORE"].abs().max(), 0.01, size)
-            self.assertEqual(report.size, size)
-
-    def test_better_team_scores_higher(self):
-        best = evaluate_team(self.players, self.ids[:13], 10)
-        worst = evaluate_team(self.players, self.ids[-13:], 10)
-        self.assertGreater(best.overall, worst.overall)
-
-    def test_turnovers_count_against(self):
-        players = self.players.copy()
-        roster = self.ids[60:73]
-        base = evaluate_team(players, roster, 10).categories.loc["TOV", "SCORE"]
-        players.loc[players["PLAYER_ID"].isin(roster), "TOTAL_TOV"] += 100
-        worse = evaluate_team(players, roster, 10).categories.loc["TOV", "SCORE"]
-        self.assertLess(worse, base)
+    def test_totals_and_per_game_add_up_each_players_stats(self):
+        categories = evaluate_team(self.players, self.roster).categories
+        self.assertAlmostEqual(categories.loc["PTS", "TOTAL"], self.rows["TOTAL_PTS"].sum())
+        self.assertAlmostEqual(categories.loc["PTS", "PER_GAME"], self.rows["PROJ_PTS"].sum())
 
     def test_team_percent_comes_from_total_makes_and_attempts(self):
-        roster = self.ids[:2]
-        rows = self.players[self.players["PLAYER_ID"].isin(roster)]
-        expected = 100 * rows["TOTAL_FGM"].sum() / rows["TOTAL_FGA"].sum()
-        report = evaluate_team(self.players, roster, 10)
-        self.assertAlmostEqual(report.categories.loc["FG", "TEAM"], expected)
+        categories = evaluate_team(self.players, self.roster).categories
+        expected = 100 * self.rows["TOTAL_FGM"].sum() / self.rows["TOTAL_FGA"].sum()
+        self.assertAlmostEqual(categories.loc["FG", "TOTAL"], expected)
+        self.assertAlmostEqual(categories.loc["FG", "PER_GAME"], expected)
 
-    def test_grade_bands(self):
-        self.assertEqual(grade(1.0), "Excellent")
-        self.assertEqual(grade(0.0), "About average")
-        self.assertEqual(grade(-1.0), "Weak")
+    def test_score_is_the_average_player_score(self):
+        categories = evaluate_team(self.players, self.roster).categories
+        self.assertAlmostEqual(categories.loc["REB", "SCORE"], self.rows["Z_REB"].mean())
 
-    def test_feedback_mentions_low_games_and_partial_roster(self):
+    def test_feedback_names_categories_and_low_games(self):
         players = self.players.copy()
+        for category in CATEGORIES:
+            players[f"Z_{category}"] = 0.5
+        players["Z_AST"] = 2.0
+        players["Z_BLK"] = -2.0
         players.loc[players["PLAYER_ID"] == self.ids[0], "PROJECTED_GP"] = 40.0
-        roster = self.ids[:3]
-        rows = players[players["PLAYER_ID"].isin(roster)]
-        notes = " ".join(team_feedback(evaluate_team(players, roster, 10), rows))
-        self.assertIn("after 3 of 13", notes)
+        rows = players[players["PLAYER_ID"].isin(self.roster)]
+        notes = " ".join(team_feedback(evaluate_team(players, self.roster), rows))
+        self.assertIn("Strongest categories: Assists", notes)
+        self.assertIn("Weakest categories: Blocks", notes)
+        self.assertIn("Punting it", notes)
         self.assertIn("Player 0 (40)", notes)
+        self.assertNotIn("typical", notes.lower())
 
 
 class Trades(unittest.TestCase):
@@ -100,7 +88,7 @@ class Trades(unittest.TestCase):
         report = analyze_trade(self.players, self.roster, [self.roster[-1]], [self.ids[0]], 10)
         self.assertGreater(report.overall_change, 0)
         self.assertEqual(report.verdict, "Helps your team")
-        self.assertEqual(report.before.size, report.after.size)
+        self.assertIn("Points", report.improved)
 
     def test_reverse_trade_hurts_by_the_same_amount(self):
         forward = analyze_trade(self.players, self.roster, [self.roster[0]], [self.ids[200]], 10)
@@ -109,24 +97,34 @@ class Trades(unittest.TestCase):
         self.assertAlmostEqual(forward.overall_change, -back.overall_change)
         self.assertEqual(forward.verdict, "Hurts your team")
 
+    def test_more_turnovers_count_against(self):
+        players = self.players.copy()
+        give, get = self.roster[0], self.ids[200]
+        same = {f"TOTAL_{stat}": players.loc[players["PLAYER_ID"] == give, f"TOTAL_{stat}"].iloc[0]
+                for stat in STATS}
+        for column, value in same.items():
+            players.loc[players["PLAYER_ID"] == get, column] = value
+        players.loc[players["PLAYER_ID"] == get, "TOTAL_TOV"] += 100
+        report = analyze_trade(players, self.roster, [give], [get], 10)
+        self.assertLess(report.moves["TOV"], 0)
+        self.assertEqual(report.declined, ["Turnovers"])
+
     def test_two_for_one_adds_a_replacement(self):
         report = analyze_trade(self.players, self.roster, self.roster[:2], [self.ids[0]], 10)
         self.assertEqual(report.replacements, 1)
         self.assertTrue(report.dropped.empty)
-        self.assertEqual(report.after.size, ROSTER_SIZE)
 
     def test_one_for_two_drops_the_lowest_value_kept_player(self):
         report = analyze_trade(self.players, self.roster, [self.roster[0]], self.ids[:2], 10)
         self.assertEqual(report.dropped["PLAYER_ID"].tolist(), [self.roster[-1]])
         self.assertEqual(report.replacements, 0)
-        self.assertEqual(report.after.size, ROSTER_SIZE)
+        self.assertEqual(len(self.roster), ROSTER_SIZE)
 
     def test_short_roster_is_compared_at_equal_size(self):
         short = self.roster[:5]
         report = analyze_trade(self.players, short, [], [self.ids[0]], 10)
-        self.assertEqual(report.before.size, 6)
-        self.assertEqual(report.after.size, 6)
         self.assertEqual(report.replacements, 0)
+        self.assertGreater(report.overall_change, 0)
 
     def test_value_totals_include_drops_and_replacements(self):
         report = analyze_trade(self.players, self.roster, [self.roster[0]], self.ids[:2], 10)

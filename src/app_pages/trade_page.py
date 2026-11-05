@@ -73,8 +73,8 @@ def render() -> None:
 
     st.divider()
     VERDICT_STYLES[report.verdict](
-        f"**{report.verdict}** · Overall score {report.before.overall:+.2f} → "
-        f"{report.after.overall:+.2f} in your {team.league_size}-team league"
+        f"**{report.verdict}** · Average category change {report.overall_change:+.2f} "
+        f"in your {team.league_size}-team league"
     )
     out_col, in_col, net_col = st.columns(3)
     out_col.metric("Value going out", f"{report.value_out:.1f}")
@@ -102,7 +102,7 @@ def render() -> None:
         st.markdown("\n".join(f"- {note}" for note in notes))
 
     st.subheader("Your team's categories")
-    st.html(trade_table_html(report.before.categories, report.after.categories))
+    st.html(trade_table_html(report.before, report.after, report.moves))
 
     st.subheader("Players in the trade")
     if giving:

@@ -44,13 +44,14 @@ Run everything from the project root.
    - My Team: draft tracker and team builder for the user's roster only (other teams are not
      tracked). Roster of 13; league size defaults to 10, from 6 to 16.
    - Trade Analyzer: how a trade changes the user's team.
-8. `src/team_analysis.py` — team scores, feedback and trade comparisons, with no Streamlit.
-   Scores use projected season totals, so games count in full (player Value counts them
-   partly). A typical S-player team in an L-team league is S average players from the top L x S,
-   which is fair during a draft without other teams' picks. Uneven trades: extras drop the
-   lowest-value kept player; open spots get the average of the next 10 unrostered players.
-   Grade bands are sized to simulated drafts (overall score spread about 0.15). All bands are
-   judgment calls. No rest-of-season scaling or current injuries yet.
+8. `src/team_analysis.py` — team stats, feedback and trade comparisons, with no Streamlit.
+   There is deliberately no team-level baseline, grade or "typical team" (removed; the user may
+   add one later with a real baseline). A category's score is the roster's average player score
+   from `rankings.py`, and strongest/weakest categories are ranked within the team. Trade
+   verdicts weigh each category's season-total change by how much rostered players differ in
+   it, which is where league size matters. Uneven trades: extras drop the lowest-value kept
+   player; open spots get the average of the next 10 unrostered players. All bands are judgment
+   calls. No rest-of-season scaling or current injuries yet.
 9. `src/league_store.py` — saves the roster to `data/league/my_team.json` (git-ignored; the
    pipeline never touches it). Tests: `python -m unittest discover tests`.
 `src/history.py` is shared (rate-history features, age/role MPG curves, production

@@ -1,11 +1,12 @@
-"""Team feedback and trade comparisons for the user's fantasy team.
+"""Team stats, feedback and trade comparisons for the user's fantasy team.
 
 No Streamlit here, so everything can be tested directly. `players` is the ranked table the
-app loads: one row per player, with RANK, VALUE, TOTAL_* stats and PROJECTED_GP.
+app loads: one row per player, with RANK, VALUE, Z_* category scores, TOTAL_* and PROJ_*
+stats, and PROJECTED_GP.
 
-Team scores use projected season totals, so games played count in full. A score says how
-far a team sits from a typical team of the same size in this league, in units of how much
-same-size teams normally differ. Above 0 is better than typical, for every category.
+There is no team-level baseline yet. A category's SCORE is the roster's average player score
+from rankings.py (compared with players projected for 500+ minutes). Above 0 is better,
+for every category.
 """
 
 from dataclasses import dataclass, field
@@ -30,15 +31,10 @@ COUNT_CATEGORIES = {
 PERCENT_CATEGORIES = {"FG": ("FG%", "FGM", "FGA"), "FT": ("FT%", "FTM", "FTA")}
 TOTAL_STATS = [*COUNT_CATEGORIES, "FGM", "FGA", "FTM", "FTA"]
 
-# Feedback bands are judgment calls: nothing here predicts league results. Grades are sized
-# to simulated snake drafts on real projections, where teams' overall scores had a spread
-# (standard deviation) of about 0.15, so most drafted teams land near average.
-RATING_BANDS = ((1.0, "Strong"), (0.35, "Above average"), (-0.35, "Average"), (-1.0, "Below average"))
-LOWEST_RATING = "Weak"
-GRADE_BANDS = ((0.3, "Excellent"), (0.1, "Above average"), (-0.1, "About average"), (-0.3, "Below average"))
-LOWEST_GRADE = "Weak"
-PUNT_SCORE = -1.25
-LOW_GAMES_GAP = 4.0
+# These bands are judgment calls: nothing here predicts league results.
+FEEDBACK_CATEGORIES = 3
+PUNT_SCORE = -0.75
+PUNT_REST_OF_TEAM = 0.25
 LOW_GAMES_PLAYER = 55.0
 TRADE_EVEN_BAND = 0.05
 TRADE_CATEGORY_MOVE = 0.1
@@ -48,17 +44,15 @@ REPLACEMENT_POOL = 10
 @dataclass
 class TeamReport:
     size: int
-    categories: pd.DataFrame  # by category: LABEL, TEAM, TYPICAL, SCORE, RATING
-    overall: float
-    grade: str
+    categories: pd.DataFrame  # by category: LABEL, TOTAL, PER_GAME, SCORE
     average_gp: float
-    typical_gp: float
 
 
 @dataclass
 class TradeReport:
-    before: TeamReport
-    after: TeamReport
+    before: pd.DataFrame  # by category: LABEL, TOTAL
+    after: pd.DataFrame
+    moves: pd.Series  # change per category in standard team units; above 0 helps
     giving: pd.DataFrame
     getting: pd.DataFrame
     dropped: pd.DataFrame
@@ -71,112 +65,55 @@ class TradeReport:
     declined: list[str] = field(default_factory=list)
 
 
-def _band(score: float, bands: tuple, lowest: str) -> str:
-    for cutoff, label in bands:
-        if score >= cutoff:
-            return label
-    return lowest
-
-
-def rating(score: float) -> str:
-    return _band(score, RATING_BANDS, LOWEST_RATING)
-
-
-def grade(score: float) -> str:
-    return _band(score, GRADE_BANDS, LOWEST_GRADE)
-
-
-def _impact(rows: pd.DataFrame, made: str, attempts: str, percent: float) -> pd.Series:
-    """Makes above what the given percentage would produce on the same attempts."""
-    return rows[f"TOTAL_{made}"] - percent * rows[f"TOTAL_{attempts}"]
-
-
-def _evaluate(rows: pd.DataFrame, players: pd.DataFrame, league_size: int) -> TeamReport:
-    """Score rows against a typical team of the same size.
-
-    In a league of L teams, after S players each, the league holds about the top L x S
-    players. So a typical S-player team is S average players from that group, which lets a
-    team be judged during a draft without tracking other teams. Spreads always come from
-    the full rostered pool, because the very top of the league alone is too small to measure.
-    """
-    size = len(rows)
-    ordered = players.sort_values("RANK")
-    typical_pool = ordered.head(league_size * size)
-    full_pool = ordered.head(league_size * ROSTER_SIZE)
-    root = np.sqrt(size)
-
-    records = {}
-    for stat, label in COUNT_CATEGORIES.items():
-        column = f"TOTAL_{stat}"
-        team, typical = rows[column].sum(), size * typical_pool[column].mean()
-        score = (team - typical) / (root * full_pool[column].std())
-        records[stat] = {"LABEL": label, "TEAM": team, "TYPICAL": typical,
-                         "SCORE": -score if stat == "TOV" else score}
+def _team_totals(rows: pd.DataFrame) -> pd.DataFrame:
+    """Each category's season total; FG% and FT% come from total makes and attempts."""
+    records = {
+        stat: {"LABEL": label, "TOTAL": rows[f"TOTAL_{stat}"].sum()}
+        for stat, label in COUNT_CATEGORIES.items()
+    }
     for key, (label, made, attempts) in PERCENT_CATEGORIES.items():
-        made_col, attempts_col = f"TOTAL_{made}", f"TOTAL_{attempts}"
-        typical_pct = typical_pool[made_col].sum() / typical_pool[attempts_col].sum()
-        full_pct = full_pool[made_col].sum() / full_pool[attempts_col].sum()
-        spread = root * _impact(full_pool, made, attempts, full_pct).std()
-        team_attempts = rows[attempts_col].sum()
+        team_attempts = rows[f"TOTAL_{attempts}"].sum()
         records[key] = {
             "LABEL": label,
-            "TEAM": 100 * rows[made_col].sum() / team_attempts if team_attempts else 0.0,
-            "TYPICAL": 100 * typical_pct,
-            "SCORE": _impact(rows, made, attempts, typical_pct).sum() / spread,
+            "TOTAL": 100 * rows[f"TOTAL_{made}"].sum() / team_attempts if team_attempts else 0.0,
         }
-    categories = pd.DataFrame.from_dict(records, orient="index")
-    categories["RATING"] = categories["SCORE"].map(rating)
-    overall = float(categories["SCORE"].mean())
-    return TeamReport(
-        size=size,
-        categories=categories,
-        overall=overall,
-        grade=grade(overall),
-        average_gp=float(rows["PROJECTED_GP"].mean()),
-        typical_gp=float(typical_pool["PROJECTED_GP"].mean()),
-    )
+    return pd.DataFrame.from_dict(records, orient="index")
 
 
 def _rows(players: pd.DataFrame, ids: list[int]) -> pd.DataFrame:
     return players.set_index("PLAYER_ID").loc[list(ids)].reset_index()
 
 
-def evaluate_team(players: pd.DataFrame, roster: list[int], league_size: int) -> TeamReport:
+def evaluate_team(players: pd.DataFrame, roster: list[int]) -> TeamReport:
     if not roster:
         raise ValueError("A team needs at least one player to evaluate.")
-    return _evaluate(_rows(players, roster), players, league_size)
+    rows = _rows(players, roster)
+    categories = _team_totals(rows)
+    # A team's per-game line adds up each player's per-game projection.
+    categories["PER_GAME"] = [
+        rows[f"PROJ_{stat}"].sum() if stat in COUNT_CATEGORIES else categories.loc[stat, "TOTAL"]
+        for stat in categories.index
+    ]
+    categories["SCORE"] = [rows[f"Z_{stat}"].mean() for stat in categories.index]
+    return TeamReport(
+        size=len(rows), categories=categories, average_gp=float(rows["PROJECTED_GP"].mean())
+    )
 
 
 def team_feedback(report: TeamReport, roster_rows: pd.DataFrame) -> list[str]:
     """Plain-language notes on the team's shape, most important first."""
-    categories = report.categories
-    labels = lambda frame: ", ".join(frame["LABEL"])
-    notes = []
-    if report.size < ROSTER_SIZE:
+    ordered = report.categories.sort_values("SCORE", ascending=False)
+    notes = [
+        f"Strongest categories: {', '.join(ordered['LABEL'].head(FEEDBACK_CATEGORIES))}.",
+        f"Weakest categories: {', '.join(ordered['LABEL'].tail(FEEDBACK_CATEGORIES).iloc[::-1])}.",
+    ]
+    lowest = ordered.iloc[-1]
+    if lowest["SCORE"] <= PUNT_SCORE and ordered["SCORE"].iloc[:-1].mean() >= PUNT_REST_OF_TEAM:
         notes.append(
-            f"Compared with a typical team after {report.size} of {ROSTER_SIZE} players. "
-            "Early picks swing this a lot."
+            f"{lowest['LABEL']} is far behind your other categories. Punting it and building "
+            "on the rest is a real option."
         )
-    strong = categories[categories["SCORE"] >= 0.35].sort_values("SCORE", ascending=False)
-    weak = categories[categories["SCORE"] <= -0.35].sort_values("SCORE")
-    if not strong.empty:
-        notes.append(f"Best categories: {labels(strong)}.")
-    if not weak.empty:
-        notes.append(f"Needs help: {labels(weak)}.")
-    if strong.empty and weak.empty:
-        notes.append("Balanced: every category is close to a typical team.")
-
-    lowest = categories.sort_values("SCORE").iloc[0]
-    if lowest["SCORE"] <= PUNT_SCORE and report.overall >= 0:
-        notes.append(
-            f"{lowest['LABEL']} is far behind, but the rest of the team is good. Punting it "
-            "and building on your other categories is a real option."
-        )
-    if report.typical_gp - report.average_gp >= LOW_GAMES_GAP:
-        notes.append(
-            f"Availability risk: your players average {report.average_gp:.0f} projected games, "
-            f"against {report.typical_gp:.0f} for a typical team."
-        )
+    notes.append(f"Your players average {report.average_gp:.0f} projected games.")
     low_games = roster_rows[roster_rows["PROJECTED_GP"] < LOW_GAMES_PLAYER].sort_values("RANK")
     if not low_games.empty:
         names = ", ".join(
@@ -198,6 +135,37 @@ def _with_replacements(rows: pd.DataFrame, count: int, replacement: pd.Series) -
     if count <= 0:
         return rows
     return pd.concat([rows, pd.DataFrame([replacement] * count)], ignore_index=True)
+
+
+def _impact(rows: pd.DataFrame, made: str, attempts: str, percent: float) -> pd.Series:
+    """Makes above what the given percentage would produce on the same attempts."""
+    return rows[f"TOTAL_{made}"] - percent * rows[f"TOTAL_{attempts}"]
+
+
+def _category_moves(
+    before: pd.DataFrame, after: pd.DataFrame, players: pd.DataFrame, league_size: int
+) -> pd.Series:
+    """Each category's change, sized by how much rostered players differ in it.
+
+    This puts points and steals on one scale, so a trade's categories can be weighed
+    together. It measures only the change, so it needs no team-level baseline.
+    """
+    pool = players.sort_values("RANK").head(league_size * ROSTER_SIZE)
+    root = np.sqrt(len(after))
+    moves = {}
+    for stat in COUNT_CATEGORIES:
+        column = f"TOTAL_{stat}"
+        move = (after[column].sum() - before[column].sum()) / (root * pool[column].std())
+        moves[stat] = -move if stat == "TOV" else move
+    for key, (_, made, attempts) in PERCENT_CATEGORIES.items():
+        percent = pool[f"TOTAL_{made}"].sum() / pool[f"TOTAL_{attempts}"].sum()
+        spread = root * _impact(pool, made, attempts, percent).std()
+        change = (
+            _impact(after, made, attempts, percent).sum()
+            - _impact(before, made, attempts, percent).sum()
+        )
+        moves[key] = change / spread
+    return pd.Series(moves)
 
 
 def analyze_trade(
@@ -225,31 +193,31 @@ def analyze_trade(
     replacement = _replacement_row(players, league_size)
     replacements = size - len(after_rows)
 
-    before = _evaluate(
-        _with_replacements(before_rows, size - len(before_rows), replacement), players, league_size
-    )
-    after = _evaluate(_with_replacements(after_rows, replacements, replacement), players, league_size)
-
-    giving_rows, getting_rows = _rows(players, giving), _rows(players, getting)
-    change = after.overall - before.overall
-    moves = after.categories["SCORE"] - before.categories["SCORE"]
+    before_team = _with_replacements(before_rows, size - len(before_rows), replacement)
+    after_team = _with_replacements(after_rows, replacements, replacement)
+    moves = _category_moves(before_team, after_team, players, league_size)
+    change = float(moves.mean())
     if change >= TRADE_EVEN_BAND:
         verdict = "Helps your team"
     elif change <= -TRADE_EVEN_BAND:
         verdict = "Hurts your team"
     else:
         verdict = "About even for your team"
+
+    before, after = _team_totals(before_team), _team_totals(after_team)
+    giving_rows, getting_rows = _rows(players, giving), _rows(players, getting)
     return TradeReport(
         before=before,
         after=after,
+        moves=moves,
         giving=giving_rows,
         getting=getting_rows,
         dropped=dropped_rows,
         replacements=replacements,
         value_out=float(giving_rows["VALUE"].sum() + dropped_rows["VALUE"].sum()),
         value_in=float(getting_rows["VALUE"].sum() + replacements * replacement["VALUE"]),
-        overall_change=float(change),
+        overall_change=change,
         verdict=verdict,
-        improved=after.categories.loc[moves >= TRADE_CATEGORY_MOVE, "LABEL"].tolist(),
-        declined=after.categories.loc[moves <= -TRADE_CATEGORY_MOVE, "LABEL"].tolist(),
+        improved=before.loc[moves >= TRADE_CATEGORY_MOVE, "LABEL"].tolist(),
+        declined=before.loc[moves <= -TRADE_CATEGORY_MOVE, "LABEL"].tolist(),
     )

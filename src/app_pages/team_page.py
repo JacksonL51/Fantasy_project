@@ -4,6 +4,7 @@ import streamlit as st
 
 from app_shared import (
     PER_GAME,
+    SEASON_TOTALS,
     category_table_html,
     player_label,
     player_row,
@@ -63,9 +64,10 @@ def render() -> None:
 
     st.session_state[LEAGUE_KEY] = team.league_size
     size_col, _ = st.columns([1, 3])
-    league_size = size_col.number_input(
+    size_col.number_input(
         "Teams in league", MIN_LEAGUE_SIZE, MAX_LEAGUE_SIZE, step=1,
         key=LEAGUE_KEY, on_change=save_league_size,
+        help="Used by the Trade Analyzer to judge trades and replacement-level pickups.",
     )
 
     add_col, roster_col = st.columns(2, gap="large")
@@ -92,41 +94,34 @@ def render() -> None:
     if not roster:
         return
 
-    report = evaluate_team(players, roster, league_size)
+    report = evaluate_team(players, roster)
     roster_rows = players[players["PLAYER_ID"].isin(roster)].sort_values("RANK")
 
     st.divider()
-    grade_col, score_col, games_col = st.columns(3)
-    grade_col.metric("Team grade", report.grade)
-    score_col.metric(
-        "Overall score", f"{report.overall:+.2f}",
-        help="Average of the nine category scores. 0 is a typical team in your league.",
-    )
-    games_col.metric(
-        "Average projected games", f"{report.average_gp:.0f}",
-        delta=f"{report.average_gp - report.typical_gp:+.0f} vs typical",
-    )
-
     st.subheader("Feedback")
     st.markdown("\n".join(f"- {note}" for note in team_feedback(report, roster_rows)))
 
+    view = st.segmented_control(
+        "Stats", [PER_GAME, SEASON_TOTALS], default=PER_GAME, required=True
+    )
+
     st.subheader("Categories")
-    st.html(category_table_html(report.categories, "Typical team"))
+    st.html(category_table_html(report.categories, view))
 
     st.subheader("Roster stats")
-    st.html(table_html(roster_rows, PER_GAME))
+    st.html(table_html(roster_rows, view))
 
     with st.expander("How this works"):
         st.markdown(
-            f"- **Typical team:** in a {league_size}-team league after {report.size} player(s) "
-            f"each, the league holds about the top {league_size * report.size} players. A "
-            "typical team has the average of that group, so it stays fair during a draft "
-            "without tracking other teams.\n"
-            "- **Score:** how far you are from typical, sized by how much teams normally "
-            "differ. Above 0 is better, including for turnovers.\n"
-            "- **Season totals:** games played count in full here, so a team score can "
-            "disagree with player Value, which counts games only partly.\n"
-            "- **Grades and ratings:** these bands are judgment calls and don't predict "
-            "league results.\n"
+            "- **Per game:** adds up each player's per-game projection, as if everyone plays "
+            "that night.\n"
+            "- **Season totals:** adds up each player's projected season, so games played "
+            "count in full.\n"
+            "- **FG% and FT%:** come from the team's total makes and attempts.\n"
+            "- **Average player score:** the average of your players' category scores from the "
+            "rankings, compared with players projected for 500+ minutes. Above 0 is better, "
+            "including for turnovers. It isn't a comparison with other fantasy teams.\n"
+            "- **Strongest and weakest categories:** ranked against each other within your "
+            "team.\n"
             "- **Stats:** projections cover a full season and don't know about current injuries."
         )
