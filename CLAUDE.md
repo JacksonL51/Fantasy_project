@@ -34,12 +34,25 @@ Run everything from the project root.
    go uncounted as a result; never discounting turnovers was tried and rejected because it
    moved guards too far (Cunningham 7 -> 23). The backtest still scores the plain season-total
    sum, so the two values differ on purpose. Still to be refined.
-7. `src/dashboard.py` — read-only Streamlit view of `projections_by_team.csv` (top 10, full
-   rankings, search, team filter, click-a-header sorting, category color switch). Needs
-   Streamlit 1.66+. The full table keeps a fixed height so searching never moves the page.
-   `streamlit run src/dashboard.py`. It only displays
-   ranks and value, calling `rank_players` from `src/rankings.py` on the current projections,
-   so tune the ranking logic there, not here.
+7. `src/dashboard.py` — Streamlit entry point and page menu; needs Streamlit 1.66+.
+   `streamlit run src/dashboard.py`. Pages live in `src/app_pages/`; `src/app_shared.py` holds
+   their data loading, tables and styling. Pages only display results, so tune logic in the
+   modules below, not in pages. Restart Streamlit after editing imported modules.
+   - Rankings: top 10, full rankings, search, team filter, click-a-header sorting, category
+     color switch. The full table keeps a fixed height so searching never moves the page. It
+     calls `rank_players` from `src/rankings.py` on the current projections.
+   - My Team: draft tracker and team builder for the user's roster only (other teams are not
+     tracked). Roster of 13; league size defaults to 10, from 6 to 16.
+   - Trade Analyzer: how a trade changes the user's team.
+8. `src/team_analysis.py` — team scores, feedback and trade comparisons, with no Streamlit.
+   Scores use projected season totals, so games count in full (player Value counts them
+   partly). A typical S-player team in an L-team league is S average players from the top L x S,
+   which is fair during a draft without other teams' picks. Uneven trades: extras drop the
+   lowest-value kept player; open spots get the average of the next 10 unrostered players.
+   Grade bands are sized to simulated drafts (overall score spread about 0.15). All bands are
+   judgment calls. No rest-of-season scaling or current injuries yet.
+9. `src/league_store.py` — saves the roster to `data/league/my_team.json` (git-ignored; the
+   pipeline never touches it). Tests: `python -m unittest discover tests`.
 `src/history.py` is shared (rate-history features, age/role MPG curves, production
 score, fitted games model). Its features must be computed identically in training and
 projection.

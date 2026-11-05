@@ -31,3 +31,6 @@ Thumbs.db
 
 # Environment Variables & Secrets
 .env
+
+# Saved fantasy team (personal, created by the app)
+data/league/
