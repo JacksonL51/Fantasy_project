@@ -113,7 +113,26 @@ DEFAULT_ROOKIE_GP = 45.0
 # Low-sample handling. The models were trained only on players with >= 200
 # minutes in both seasons, so smaller samples are shrunk toward replacement.
 CREDIBILITY_MINUTES = 200.0
-STALE_CREDIBILITY_CAP = 0.5  # max model weight if the player missed last season
+# Max model weight if the player missed last season. Age is as of the last season
+# played. Past returners kept most of their rates at every age; 0.5 for veterans is a
+# judgment call standing in for minutes and games risk, not something the rates show.
+STALE_CREDIBILITY_CAP = 0.85
+STALE_VETERAN_MIN_AGE = 31.0
+STALE_VETERAN_CREDIBILITY_CAP = 0.5
+# Short-season return: a young starter's short latest season (minutes held) is a weak
+# signal. Rates and active MPG average two views: one where the season counts for little
+# (history rates as the model input, MPG weight scaled by GP) and one where it is ignored.
+# Past cases support this group only; other short-season players got worse. Games
+# projections do not change because discounting them raised over-projection. The
+# averaging helps points and assists, but slightly hurts steals and blocks.
+SHORT_SEASON_IGNORE_SHARE = 0.5
+SHORT_SEASON_GP_RANGE = (15, 29)
+SHORT_SEASON_MIN_MINUTES = 200.0
+SHORT_SEASON_MAX_AGE = 30.0
+SHORT_SEASON_PRIOR_MIN_MINUTES = 1000.0
+SHORT_SEASON_PRIOR_MIN_MPG = 28.0
+SHORT_SEASON_MAX_MPG_DROP = 5.0
+SHORT_SEASON_FULL_GP = 60.0  # the latest season's MPG weight scales by GP / this
 REPLACEMENT_MIN_RANGE = (200.0, 800.0)  # bench-level pool for replacement rates
 
 # Output checks
@@ -182,6 +201,28 @@ def load_history(path=TRAINING_DATA_PATH) -> pd.DataFrame:
     return _load_history(path, TARGET_STATS)
 
 
+def _is_short_season_return(seasons: pd.DataFrame, latest_year: int) -> bool:
+    """True for a young starter whose minutes held in a short latest season."""
+    last = seasons.iloc[-1]
+    before = seasons.loc[seasons["SEASON_YEAR"] == latest_year - 1]
+    if last["SEASON_YEAR"] != latest_year or before.empty:
+        return False
+    before = before.iloc[-1]
+    if not (
+        SHORT_SEASON_GP_RANGE[0] <= last["GP"] <= SHORT_SEASON_GP_RANGE[1]
+        and last["MIN"] >= SHORT_SEASON_MIN_MINUTES
+        and last["AGE"] <= SHORT_SEASON_MAX_AGE
+        and before["MIN"] >= SHORT_SEASON_PRIOR_MIN_MINUTES
+        and before["GP"] > 0
+    ):
+        return False
+    before_mpg = before["MIN"] / before["GP"]
+    return bool(
+        before_mpg >= SHORT_SEASON_PRIOR_MIN_MPG
+        and last["MIN"] / last["GP"] >= before_mpg - SHORT_SEASON_MAX_MPG_DROP
+    )
+
+
 def latest_season_rows(history: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     """Build three-season recency-weighted player profiles."""
     latest_year = int(history["SEASON_YEAR"].max())
@@ -225,9 +266,13 @@ def latest_season_rows(history: pd.DataFrame) -> tuple[pd.DataFrame, int]:
             career_first_year.loc[player_id]
         )
 
+        short_return = _is_short_season_return(seasons, latest_year)
+        latest_player_season["SHORT_SEASON_RETURN"] = short_return
         healthy_seasons = seasons.loc[seasons["GP"] >= 15]
         if healthy_seasons.empty:
             latest_player_season["BASELINE_ACTIVE_MPG"] = np.nan
+            latest_player_season["ROTATION_BASELINE_MPG"] = np.nan
+            latest_player_season["PRE_SHORT_BASELINE_MPG"] = np.nan
             latest_player_season["ELIGIBLE_MPG_SEASONS"] = 0
         else:
             healthy_weights = healthy_seasons["RECENCY_WEIGHT"].to_numpy(
@@ -241,6 +286,20 @@ def latest_season_rows(history: pd.DataFrame) -> tuple[pd.DataFrame, int]:
             latest_player_season["BASELINE_ACTIVE_MPG"] = float(
                 np.average(season_mpg, weights=healthy_weights)
             )
+            # BASELINE_ACTIVE_MPG stays unscaled: it also feeds the games projections.
+            rotation_weights = healthy_weights.copy()
+            if short_return:
+                rotation_weights[-1] *= min(
+                    healthy_seasons["GP"].iloc[-1] / SHORT_SEASON_FULL_GP, 1.0
+                )
+            latest_player_season["ROTATION_BASELINE_MPG"] = float(
+                np.average(season_mpg, weights=rotation_weights)
+            )
+            latest_player_season["PRE_SHORT_BASELINE_MPG"] = (
+                float(np.average(season_mpg[:-1], weights=healthy_weights[:-1]))
+                if short_return
+                else np.nan
+            )
             latest_player_season["ELIGIBLE_MPG_SEASONS"] = len(healthy_seasons)
         latest_player_season["PLAYER_ID"] = player_id
         profile_rows.append(latest_player_season)
@@ -253,6 +312,20 @@ def latest_season_rows(history: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     profiles = profiles.merge(
         features, on=["PLAYER_ID", "SEASON_YEAR"], how="left", validate="one_to_one"
     )
+    # The season before the latest one, for short-season returns (see SHORT_SEASON_*).
+    rate_columns = [f"{stat}_RATE" for stat in TARGET_STATS]
+    before_season = ordered.loc[
+        ordered["SEASON_YEAR"] == latest_year - 1, ["PLAYER_ID", "MIN"] + rate_columns
+    ].merge(
+        features.loc[features["SEASON_YEAR"] == latest_year - 1].drop(columns="SEASON_YEAR"),
+        on="PLAYER_ID", how="left", validate="one_to_one",
+    )
+    before_season = before_season.rename(
+        columns={
+            column: f"PRE_{column}" for column in before_season.columns if column != "PLAYER_ID"
+        }
+    )
+    profiles = profiles.merge(before_season, on="PLAYER_ID", how="left", validate="one_to_one")
     # Production score (rotation-jump model) and games-played features, both
     # built by history.py exactly as they are for training.
     profiles = profiles.merge(
@@ -328,6 +401,13 @@ def build_inference_table(
             table["HIST_SUBSTITUTED"], f"{stat}_RATE_hist"
         ]
 
+    # Short-season return: history rates are the model's last-season input.
+    table["SHORT_SEASON_RETURN"] = table["SHORT_SEASON_RETURN"].eq(True)
+    for stat in TARGET_STATS:
+        table.loc[table["SHORT_SEASON_RETURN"], f"{stat}_RATE_prior"] = table.loc[
+            table["SHORT_SEASON_RETURN"], f"{stat}_RATE_hist"
+        ]
+
     print(
         f"Matched to history: {int((~table['NO_PRIOR_DATA']).sum())}; "
         f"no prior data: {int(table['NO_PRIOR_DATA'].sum())}; "
@@ -344,15 +424,38 @@ def predict_with_credibility(
 ) -> tuple[pd.DataFrame, pd.Series]:
     """Model rates blended toward replacement for small or stale samples.
 
-    weight = clip(MIN_prior / 200, 0, 1), capped at 0.5 for stale rows.
+    weight = clip(MIN_prior / 200, 0, 1). Stale rows are capped at 0.85, or at 0.5
+    for players aged 31+ in their last season played.
     Rookies have MIN_prior = 0, so they get pure replacement rates.
     """
     predicted = predict_rates(bundle, table)
+    short = table["SHORT_SEASON_RETURN"]
+    if short.any():
+        # Average with the prediction made as if the short season never happened.
+        ignored = table.loc[short].copy()
+        ignored["MIN_prior"] = ignored["PRE_MIN"]
+        ignored["HIST_MIN"] = ignored["PRE_HIST_MIN"]
+        ignored["HIST_SEASONS"] = ignored["PRE_HIST_SEASONS"]
+        for stat in TARGET_STATS:
+            ignored[f"{stat}_RATE_prior"] = ignored[f"PRE_{stat}_RATE"]
+            ignored[f"{stat}_RATE_hist"] = ignored[f"PRE_{stat}_RATE_hist"]
+        predicted.loc[short, TARGET_STATS] = (
+            (1.0 - SHORT_SEASON_IGNORE_SHARE) * predicted.loc[short, TARGET_STATS]
+            + SHORT_SEASON_IGNORE_SHARE * predict_rates(bundle, ignored)[TARGET_STATS]
+        )
     effective_minutes = table["MIN_prior"].where(
         ~table["HIST_SUBSTITUTED"], CREDIBILITY_MINUTES
     )
     weight = np.clip(effective_minutes / CREDIBILITY_MINUTES, 0.0, 1.0)
-    weight = weight.where(~table["STALE_DATA"], weight.clip(upper=STALE_CREDIBILITY_CAP))
+    stale_cap = pd.Series(
+        np.where(
+            table["AGE_prior"] >= STALE_VETERAN_MIN_AGE,
+            STALE_VETERAN_CREDIBILITY_CAP,
+            STALE_CREDIBILITY_CAP,
+        ),
+        index=table.index,
+    )
+    weight = weight.where(~table["STALE_DATA"], np.minimum(weight, stale_cap))
 
     replacement_matrix = pd.DataFrame(
         np.outer(1.0 - weight.to_numpy(), replacement.reindex(TARGET_STATS).to_numpy()),
@@ -386,19 +489,28 @@ def raw_minutes_and_gp(
     """
     Return multi-season healthy MPG and the injury-adjusted model games estimate.
     """
-    active_mpg = table["BASELINE_ACTIVE_MPG"].fillna(MIN_HEALTHY_MPG)
-    if curve is not None and curve.get("active", False):
-        # Players with real history only; rookies / no-data rows stay at the floor.
-        if curve.get("kind", "age") == "role":
-            adjustment = role_mpg_adjustment(
-                curve, table["AGE_prior"], active_mpg, table["PROD_Z"]
-            )
-        else:
-            adjustment = age_mpg_adjustment(curve, table["AGE_prior"], active_mpg)
-        active_mpg = active_mpg + adjustment.where(
-            table["ELIGIBLE_MPG_SEASONS"].fillna(0) > 0, 0.0
+    def adjusted_mpg(baseline: pd.Series) -> pd.Series:
+        mpg = baseline.fillna(MIN_HEALTHY_MPG)
+        if curve is not None and curve.get("active", False):
+            # Players with real history only; rookies / no-data rows stay at the floor.
+            if curve.get("kind", "age") == "role":
+                adjustment = role_mpg_adjustment(
+                    curve, table["AGE_prior"], mpg, table["PROD_Z"]
+                )
+            else:
+                adjustment = age_mpg_adjustment(curve, table["AGE_prior"], mpg)
+            mpg = mpg + adjustment.where(table["ELIGIBLE_MPG_SEASONS"].fillna(0) > 0, 0.0)
+        return mpg.clip(lower=MIN_HEALTHY_MPG, upper=MAX_HEALTHY_MPG)
+
+    active_mpg = adjusted_mpg(table["ROTATION_BASELINE_MPG"])
+    short = table["SHORT_SEASON_RETURN"]
+    if short.any():
+        ignored_mpg = adjusted_mpg(table["PRE_SHORT_BASELINE_MPG"])
+        active_mpg = active_mpg.where(
+            ~short,
+            (1.0 - SHORT_SEASON_IGNORE_SHARE) * active_mpg
+            + SHORT_SEASON_IGNORE_SHARE * ignored_mpg,
         )
-    active_mpg = active_mpg.clip(lower=MIN_HEALTHY_MPG, upper=MAX_HEALTHY_MPG)
     weighted_gp = table["WEIGHTED_GP"].fillna(DEFAULT_ROOKIE_GP)
     min_gp = table["GP_MIN"]
     max_gp = table["GP_MAX"]
@@ -518,7 +630,9 @@ def fitted_games(
     base_mpg = (
         table["BASELINE_ACTIVE_MPG"].fillna(table["MIN"] / table["GP"]).fillna(8.0)
     )
-    frame = table[["GF_LAST", "GF_W", "GF_MIN", "GF_MAX", "GF_N"]].copy()
+    frame = table[
+        ["GF_LAST", "GF_W", "GF_MIN", "GF_MAX", "GF_N", "GF_5YR", "GF_5YR_N", "GF_75_PLUS"]
+    ].copy()
     frame["BASE_MPG"] = base_mpg
     frame["AGE"] = table["AGE_prior"]
     usable = (
@@ -804,6 +918,7 @@ def synthesize_stats(
     projections["DATA_SEASON"] = table["SEASON_YEAR"]
     projections["NO_PRIOR_DATA"] = table["NO_PRIOR_DATA"]
     projections["STALE_DATA"] = table["STALE_DATA"]
+    projections["SHORT_SEASON_RETURN"] = table["SHORT_SEASON_RETURN"]
     projections["MPG_BLENDED"] = mpg_blended
     projections["LAST_PTS_PG"] = table["PTS_RATE"] * table["MIN"] / table["GP"]
     
@@ -929,6 +1044,7 @@ def main() -> None:
         "DATA_SEASON",
         "NO_PRIOR_DATA",
         "STALE_DATA",
+        "SHORT_SEASON_RETURN",
         "MPG_BLENDED",
         "LAST_PTS_PG",
     ]

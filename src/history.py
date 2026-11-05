@@ -242,10 +242,17 @@ ROLE_CLIP = 3.0  # max +/- MPG adjustment
 ROLE_LOW_MPG = 22.0  # production matters most below this baseline MPG
 GAMES_RIDGE_ALPHA = 10.0
 GAMES_MIN_NEXT_MINUTES = 200.0  # next-season minutes needed to enter the fit
-GAMES_BOUNDS = (15.0, 78.0)
+GAMES_BOUNDS = (15.0, 82.0)
+GAMES_ROTATION_MIN_MPG = 20.0  # at or above: durability model; below: low GP is mostly role
+GAMES_MIN_ROTATION_PAIRS = 300
+GAMES_FULL_SEASON = 82.0
+# Shortened seasons are scaled to 82 games so 72 in 2021 does not read as missed time.
+GAMES_SHORTENED_SEASONS = {1999: 50.0, 2012: 66.0, 2020: 72.0, 2021: 72.0}
+GAMES_DURABLE_GP = 75.0
 GAMES_FEATURES = [
-    "GF_LAST", "GF_W", "GF_MIN", "GF_MAX", "GF_N", "BASE_MPG", "AGE", "AGE_SQ",
+    "GF_LAST", "GF_W", "GF_MIN", "GF_MAX", "GF_N", "BASE_MPG", "AGE", "AGE_SQ", "GF_W_X_MPG",
 ]
+GAMES_ROTATION_FEATURES = GAMES_FEATURES + ["GF_5YR", "GF_5YR_N", "GF_75_PLUS"]
 
 
 def season_production_z(history: pd.DataFrame) -> pd.DataFrame:
@@ -378,14 +385,23 @@ def role_mpg_adjustment(curve: dict, age: pd.Series, mpg: pd.Series, prod: pd.Se
     return (ROLE_SHRINK * predicted).clip(-ROLE_CLIP, ROLE_CLIP).fillna(0.0)
 
 
+def _games_per_82(history: pd.DataFrame) -> pd.Series:
+    """Games played, scaled to 82 for shortened seasons and capped at 82."""
+    full_season = history["SEASON_YEAR"].map(GAMES_SHORTENED_SEASONS).fillna(GAMES_FULL_SEASON)
+    return (history["GP"] * GAMES_FULL_SEASON / full_season).clip(upper=GAMES_FULL_SEASON)
+
+
 def games_feature_table(history: pd.DataFrame) -> pd.DataFrame:
     """Games-played features per (PLAYER_ID, SEASON_YEAR t), seasons <= t only.
 
-    GF_LAST = games in t; GF_W = recency-weighted mean of games over seasons
-    t, t-1, t-2 that exist; GF_MIN / GF_MAX = lowest / highest of those;
-    GF_N = how many of the three exist.
+    All use games per 82. GF_LAST = games in t; GF_W = recency-weighted mean of
+    games over seasons t, t-1, t-2 that exist; GF_MIN / GF_MAX = lowest / highest
+    of those; GF_N = how many of the three exist. GF_5YR = mean over up to five
+    calendar seasons since debut, with a season missed entirely counted as 0;
+    GF_5YR_N = how many seasons that covers; GF_75_PLUS = how many of the latest
+    three of them reached 75 games.
     """
-    wide = _wide(history, history["GP"])
+    wide = _wide(history, _games_per_82(history))
     stack = np.stack([wide.shift(lag, axis=1).to_numpy() for lag in range(3)])
     weights = np.asarray(ROLE_WEIGHTS)[:, None, None]
     valid = ~np.isnan(stack)
@@ -394,6 +410,22 @@ def games_feature_table(history: pd.DataFrame) -> pd.DataFrame:
         weighted = (np.where(valid, stack, 0.0) * weights).sum(axis=0) / weight_sum
         lowest = np.where(valid, stack, np.inf).min(axis=0)
         highest = np.where(valid, stack, -np.inf).max(axis=0)
+    debut = history.groupby("PLAYER_ID")["SEASON_YEAR"].min().reindex(wide.index).to_numpy()
+    years = wide.columns.to_numpy()
+    five = np.stack(
+        [
+            np.where(
+                (years - lag)[None, :] >= debut[:, None],
+                np.nan_to_num(wide.shift(lag, axis=1).to_numpy()),
+                np.nan,
+            )
+            for lag in range(5)
+        ]
+    )
+    five_count = (~np.isnan(five)).sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        five_mean = np.nansum(five, axis=0) / five_count
+    durable_count = (np.nan_to_num(five[:3]) >= GAMES_DURABLE_GP).sum(axis=0)
     table = pd.DataFrame(
         {
             "GF_LAST": wide.to_numpy().ravel(),
@@ -401,6 +433,9 @@ def games_feature_table(history: pd.DataFrame) -> pd.DataFrame:
             "GF_MIN": lowest.ravel(),
             "GF_MAX": highest.ravel(),
             "GF_N": valid.sum(axis=0).ravel(),
+            "GF_5YR": five_mean.ravel(),
+            "GF_5YR_N": five_count.ravel(),
+            "GF_75_PLUS": durable_count.ravel(),
         },
         index=pd.MultiIndex.from_product(
             [wide.index, wide.columns], names=["PLAYER_ID", "SEASON_YEAR"]
@@ -409,24 +444,51 @@ def games_feature_table(history: pd.DataFrame) -> pd.DataFrame:
     return table.dropna(subset=["GF_LAST"]).reset_index()
 
 
-def _games_matrix(frame: pd.DataFrame) -> np.ndarray:
+def _games_matrix(frame: pd.DataFrame, names: list[str]) -> np.ndarray:
     age = pd.to_numeric(frame["AGE"], errors="coerce").fillna(26.0).to_numpy(dtype=float)
     columns = []
-    for name in GAMES_FEATURES:
+    for name in names:
         if name == "AGE":
             columns.append(age)
         elif name == "AGE_SQ":
             columns.append(age**2)
+        elif name == "GF_W_X_MPG":
+            columns.append(
+                frame["GF_W"].to_numpy(dtype=float) * frame["BASE_MPG"].to_numpy(dtype=float)
+            )
         else:
             columns.append(frame[name].to_numpy(dtype=float))
     return np.column_stack(columns)
 
 
+def _fit_games_ridge(pairs: pd.DataFrame, names: list[str], alpha: float) -> dict:
+    design = _games_matrix(pairs, names)
+    mean, scale = design.mean(axis=0), design.std(axis=0)
+    scale[scale == 0] = 1.0
+    standardized = (design - mean) / scale
+    target = pairs["GP_NEXT"].to_numpy(dtype=float)
+    intercept = float(target.mean())
+    gram = standardized.T @ standardized + alpha * np.eye(standardized.shape[1])
+    coef = np.linalg.solve(gram, standardized.T @ (target - intercept))
+    return {
+        "intercept": intercept, "mean": mean.tolist(), "scale": scale.tolist(),
+        "coef": coef.tolist(), "features": names,
+    }
+
+
+def _predict_games_ridge(model: dict, frame: pd.DataFrame) -> np.ndarray:
+    design = _games_matrix(frame, model["features"])
+    standardized = (design - np.asarray(model["mean"])) / np.asarray(model["scale"])
+    return model["intercept"] + standardized @ np.asarray(model["coef"])
+
+
 def fit_games_model(history: pd.DataFrame, alpha: float = GAMES_RIDGE_ALPHA) -> dict:
-    """Ridge regression of next-season games on games history, role and age.
+    """Ridge regressions of next-season games per 82.
 
     Pairs are (season t features) -> games in t+1, where the player had >= 200
-    minutes in t+1 (the same population the projections are scored on).
+    minutes in t+1 (the same population the projections are scored on). Players
+    with GAMES_ROTATION_MIN_MPG or more get a model trained only on such players,
+    with longer-term durability features; everyone else uses a model of all pairs.
     """
     features = games_feature_table(history).merge(
         role_feature_table(history)[["PLAYER_ID", "SEASON_YEAR", "AGE", "BASE_MPG"]],
@@ -436,31 +498,32 @@ def fit_games_model(history: pd.DataFrame, alpha: float = GAMES_RIDGE_ALPHA) -> 
     features = features.merge(last, on=["PLAYER_ID", "SEASON_YEAR"], how="left")
     features["BASE_MPG"] = features["BASE_MPG"].fillna(features["MIN"] / features["GP"])
     following = history.loc[
-        history["MIN"] >= GAMES_MIN_NEXT_MINUTES, ["PLAYER_ID", "SEASON_YEAR", "GP"]
-    ].rename(columns={"GP": "GP_NEXT"})
+        history["MIN"] >= GAMES_MIN_NEXT_MINUTES, ["PLAYER_ID", "SEASON_YEAR"]
+    ].copy()
+    following["GP_NEXT"] = _games_per_82(history).loc[following.index]
     following["SEASON_YEAR"] -= 1
+    required = [
+        name for name in GAMES_ROTATION_FEATURES if name not in ("AGE_SQ", "GF_W_X_MPG")
+    ]
     pairs = features.merge(following, on=["PLAYER_ID", "SEASON_YEAR"]).dropna(
-        subset=GAMES_FEATURES[:-2] + ["GP_NEXT"]
+        subset=required + ["GP_NEXT"]
     )
-    if len(pairs) < 300:
+    rotation = pairs.loc[pairs["BASE_MPG"] >= GAMES_ROTATION_MIN_MPG]
+    if len(pairs) < 300 or len(rotation) < GAMES_MIN_ROTATION_PAIRS:
         return {"active": False, "pairs": int(len(pairs))}
-    design = _games_matrix(pairs)
-    mean, scale = design.mean(axis=0), design.std(axis=0)
-    scale[scale == 0] = 1.0
-    standardized = (design - mean) / scale
-    target = pairs["GP_NEXT"].to_numpy(dtype=float)
-    intercept = float(target.mean())
-    gram = standardized.T @ standardized + alpha * np.eye(standardized.shape[1])
-    coef = np.linalg.solve(gram, standardized.T @ (target - intercept))
     return {
-        "active": True, "pairs": int(len(pairs)), "intercept": intercept,
-        "mean": mean.tolist(), "scale": scale.tolist(), "coef": coef.tolist(),
-        "features": GAMES_FEATURES,
+        "active": True, "pairs": int(len(pairs)), "rotation_pairs": int(len(rotation)),
+        "rotation_min_mpg": GAMES_ROTATION_MIN_MPG,
+        "rotation": _fit_games_ridge(rotation, GAMES_ROTATION_FEATURES, alpha),
+        "general": _fit_games_ridge(pairs, GAMES_FEATURES, alpha),
     }
 
 
 def predict_games(model: dict, frame: pd.DataFrame) -> pd.Series:
-    """Fitted games, clipped to 15-78. `frame` needs GAMES_FEATURES minus AGE_SQ."""
-    design = (_games_matrix(frame) - np.asarray(model["mean"])) / np.asarray(model["scale"])
-    predicted = model["intercept"] + design @ np.asarray(model["coef"])
+    """Fitted games, clipped to 15-82. `frame` needs the games features, BASE_MPG and AGE."""
+    predicted = np.where(
+        frame["BASE_MPG"].to_numpy(dtype=float) >= model["rotation_min_mpg"],
+        _predict_games_ridge(model["rotation"], frame),
+        _predict_games_ridge(model["general"], frame),
+    )
     return pd.Series(np.clip(predicted, *GAMES_BOUNDS), index=frame.index)
