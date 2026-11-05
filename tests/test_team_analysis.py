@@ -10,7 +10,16 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from league_store import MyTeam, load_team, save_team
+from league_store import (
+    League,
+    Team,
+    add_team,
+    default_team_name,
+    delete_team,
+    load_league,
+    name_problem,
+    save_league,
+)
 from team_analysis import ROSTER_SIZE, analyze_trade, average_player, evaluate_team, team_feedback
 
 STATS = ["PTS", "FG3M", "REB", "AST", "STL", "BLK", "TOV", "FGM", "FGA", "FTM", "FTA"]
@@ -150,27 +159,86 @@ class Trades(unittest.TestCase):
 class Saving(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
-        self.path = Path(self.folder.name) / "league" / "my_team.json"
+        folder = Path(self.folder.name) / "league"
+        self.path = folder / "teams.json"
+        self.legacy = folder / "my_team.json"
+        folder.mkdir()
 
     def tearDown(self):
         self.folder.cleanup()
 
-    def test_round_trip_and_default(self):
-        self.assertEqual(load_team(self.path), MyTeam())
-        save_team(MyTeam(12, [3, 1, 2]), self.path)
-        self.assertEqual(load_team(self.path), MyTeam(12, [3, 1, 2]))
+    def load(self) -> League:
+        return load_league(self.path, self.legacy)
+
+    def test_starts_empty(self):
+        self.assertEqual(self.load(), League())
+
+    def test_teams_round_trip_with_names_and_their_own_rosters(self):
+        league = self.load()
+        first = add_team(league, Team("Team1", 12, [3, 1, 2]))
+        second = add_team(league, Team("  Dynasty  ", 8, [4]))
+        save_league(league, self.path)
+        loaded = self.load()
+        self.assertEqual([t.name for t in loaded.teams], ["Team1", "Dynasty"])
+        self.assertEqual(loaded.team(first.id).roster, [3, 1, 2])
+        self.assertEqual(loaded.team(second.id).league_size, 8)
+        self.assertEqual(loaded.active_id, second.id)
+
+    def test_older_saved_team_becomes_team1_and_is_left_in_place(self):
+        self.legacy.write_text('{"league_size": 12, "roster": [7, 8]}', encoding="utf-8")
+        league = self.load()
+        self.assertEqual(league.teams, [Team("Team1", 12, [7, 8], 1)])
+        self.assertEqual(league.active_id, 1)
+        self.assertEqual(add_team(league, Team("Team2")).id, 2)
+        save_league(league, self.path)
+        self.assertTrue(self.legacy.exists())
+        self.assertEqual(len(self.load().teams), 2)
+
+    def test_deleted_older_team_does_not_come_back(self):
+        self.legacy.write_text('{"league_size": 12, "roster": [7]}', encoding="utf-8")
+        league = self.load()
+        delete_team(league, 1)
+        save_league(league, self.path)
+        self.assertEqual(self.load().teams, [])
+        self.assertIsNone(self.load().active_id)
+
+    def test_deleted_team_ids_are_not_reused(self):
+        league = self.load()
+        first = add_team(league, Team("A"))
+        delete_team(league, first.id)
+        self.assertNotEqual(add_team(league, Team("B")).id, first.id)
 
     def test_bad_values_are_corrected(self):
-        self.path.parent.mkdir(parents=True)
-        self.path.write_text('{"league_size": 40, "roster": [1, 1, 2]}', encoding="utf-8")
-        self.assertEqual(load_team(self.path), MyTeam(16, [1, 2]))
+        self.path.write_text(
+            '{"teams": [{"id": 3, "name": "A", "league_size": 40, "roster": [1, 1, 2]}]}',
+            encoding="utf-8",
+        )
+        league = self.load()
+        self.assertEqual(league.teams, [Team("A", 16, [1, 2], 3)])
+        self.assertEqual(league.next_id, 4)
+        self.assertEqual(league.active_id, 3)
 
-    def test_unreadable_file_reports_a_problem(self):
-        self.path.parent.mkdir(parents=True)
+    def test_unreadable_file_is_kept_and_reported(self):
         self.path.write_text("not json", encoding="utf-8")
-        team = load_team(self.path)
-        self.assertEqual(team.roster, [])
-        self.assertIsNotNone(team.problem)
+        league = self.load()
+        self.assertEqual(league.teams, [])
+        self.assertIsNotNone(league.problem)
+        kept = self.path.with_name("teams.unreadable.json")
+        self.assertEqual(kept.read_text(encoding="utf-8"), "not json")
+
+    def test_default_names_use_the_first_free_number(self):
+        self.assertEqual(default_team_name([]), "Team1")
+        teams = [Team("Team1"), Team("team3")]
+        self.assertEqual(default_team_name(teams), "Team2")
+        self.assertEqual(default_team_name([*teams, Team("TEAM2")]), "Team4")
+
+    def test_name_rules(self):
+        teams = [Team("Dynasty", id=1), Team("Team2", id=2)]
+        self.assertIsNone(name_problem("Keepers", teams))
+        self.assertIn("blank", name_problem("   ", teams))
+        self.assertIn("already", name_problem(" dynasty ", teams))
+        self.assertIsNone(name_problem("Dynasty", teams, ignoring_id=1))
+        self.assertIn("up to", name_problem("x" * 41, teams))
 
 
 if __name__ == "__main__":

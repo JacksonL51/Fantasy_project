@@ -40,6 +40,10 @@ STAT_TITLES = {
 PER_GAME = "Per game"
 SEASON_TOTALS = "Season totals"
 
+# A new team stays in the session until it's saved. Pages can use it while it's unsaved.
+DRAFT_KEY = "unsaved_team"
+DRAFT_CHOICE = "unsaved"
+
 # Category tint: blue is a strength, red is a weakness, no tint is near average. The bands
 # are category z-scores from rankings.py, with turnovers already flipped so blue is good.
 TINT_LIGHT_FROM = 1.0
@@ -141,6 +145,26 @@ def require_players() -> tuple[pd.DataFrame, datetime]:
         st.stop()
     modified = PROJECTIONS_PATH.stat().st_mtime
     return load_players(str(PROJECTIONS_PATH), modified), datetime.fromtimestamp(modified)
+
+
+def team_choices(league) -> list:
+    """Team picker options: saved team IDs, plus the unsaved new team if there is one."""
+    choices = [team.id for team in league.teams]
+    if DRAFT_KEY in st.session_state:
+        choices.append(DRAFT_CHOICE)
+    return choices
+
+
+def team_choice_label(league):
+    """A function that shows a team picker option as the team's name."""
+    names = {team.id: team.name for team in league.teams}
+
+    def label(choice) -> str:
+        if choice == DRAFT_CHOICE:
+            return f"{st.session_state[DRAFT_KEY].name or 'New team'} (not saved)"
+        return names.get(choice, str(choice))
+
+    return label
 
 
 def player_label(players: pd.DataFrame):

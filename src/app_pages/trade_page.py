@@ -3,15 +3,19 @@
 import streamlit as st
 
 from app_shared import (
+    DRAFT_CHOICE,
+    DRAFT_KEY,
     PER_GAME,
     SEASON_TOTALS,
     player_label,
     player_row,
     player_search,
     require_players,
+    team_choice_label,
+    team_choices,
     trade_table_html,
 )
-from league_store import load_team
+from league_store import load_league
 from team_analysis import analyze_trade
 
 VERDICT_STYLES = {
@@ -21,6 +25,9 @@ VERDICT_STYLES = {
 }
 GETTING_KEY = "trade_getting"
 SEARCH_KEY = "trade_search"
+CHOICE_KEY = "trade_team_choice"  # the chosen team; kept across pages
+CHOICE_WIDGET = "trade_team_picker"
+MY_TEAM_CHOICE_KEY = "my_team_choice"
 
 
 def add_incoming(player_id: int, search_key: str) -> None:
@@ -34,14 +41,42 @@ def remove_incoming(player_id: int) -> None:
     ]
 
 
+def choose_team() -> None:
+    st.session_state[CHOICE_KEY] = st.session_state[CHOICE_WIDGET]
+    st.session_state[GETTING_KEY] = []
+    st.session_state[SEARCH_KEY] = ""
+
+
 def render() -> None:
     st.title("Trade Analyzer")
     players, _ = require_players()
-    team = load_team()
+    league = load_league()
+    if league.problem:
+        st.warning(league.problem)
+    choices = team_choices(league)
+    if not choices:
+        st.info("Create a team on the My Team page first. Trades are measured against a team.")
+        return
+
+    # Start on the team open on the My Team page; after that, keep this page's own choice.
+    choice = st.session_state.get(CHOICE_KEY)
+    if choice not in choices:
+        choice = st.session_state.get(MY_TEAM_CHOICE_KEY)
+    if choice not in choices:
+        choice = league.active_id if league.active_id in choices else choices[0]
+    st.session_state[CHOICE_KEY] = choice
+    st.session_state[CHOICE_WIDGET] = choice
+    pick_col, _ = st.columns([1, 2])
+    pick_col.selectbox(
+        "Your team", choices, format_func=team_choice_label(league),
+        key=CHOICE_WIDGET, on_change=choose_team,
+    )
+    team = st.session_state[DRAFT_KEY] if choice == DRAFT_CHOICE else league.team(choice)
+
     known = set(players["PLAYER_ID"])
     roster = [player for player in team.roster if player in known]
     if not roster:
-        st.info("Add players on the My Team page first. Trades are measured against that roster.")
+        st.info(f"{team.name} has no players yet. Add some on the My Team page.")
         return
 
     # Someone added to the roster since they were chosen can't also be incoming.
@@ -54,7 +89,7 @@ def render() -> None:
         giving = [
             player_id
             for player_id in by_rank
-            if st.checkbox(describe(player_id), key=f"trade_give_{player_id}")
+            if st.checkbox(describe(player_id), key=f"trade_give_{choice}_{player_id}")
         ]
     with get_col:
         st.subheader("You get")

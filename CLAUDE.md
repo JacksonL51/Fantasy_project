@@ -41,8 +41,8 @@ Run everything from the project root.
    - Rankings: top 10, full rankings, search, team filter, click-a-header sorting, category
      color switch. The full table keeps a fixed height so searching never moves the page. It
      calls `rank_players` from `src/rankings.py` on the current projections.
-   - My Team: draft tracker and team builder for the user's roster only (other teams are not
-     tracked). Roster of 13; league size defaults to 10, from 6 to 16.
+   - My Team: draft tracker and team builder for the user's own named teams (other league
+     teams are not tracked). Roster of 13; league size is per team, defaults to 10, from 6 to 16.
    - Trade Analyzer: how a trade changes the user's team. One table holds the players in the
      trade. Per game adds an Average row for a side with 2+ players (the side as one player,
      with percentages from combined makes and attempts); season totals adds the team's before,
@@ -56,8 +56,11 @@ Run everything from the project root.
    it, which is where league size matters. Uneven trades: extras drop the lowest-value kept
    player; open spots get the average of the next 10 unrostered players. All bands are judgment
    calls. No rest-of-season scaling or current injuries yet.
-9. `src/league_store.py` — saves the roster to `data/league/my_team.json` (git-ignored; the
-   pipeline never touches it). Tests: `python -m unittest discover tests`.
+9. `src/league_store.py` — saves named teams to `data/league/teams.json` (git-ignored; the
+   pipeline never touches it). The older `my_team.json` is read once as Team1 if `teams.json`
+   doesn't exist yet. New teams stay in the session until saved; saved teams then save every
+   change right away. Default names are the first free Team1, Team2 and so on, and names are
+   unique. The Trade Analyzer picks which team to use, including an unsaved one. Tests: `python -m unittest discover tests`.
 `src/history.py` is shared (rate-history features, age/role MPG curves, production
 score, fitted games model). Its features must be computed identically in training and
 projection.
