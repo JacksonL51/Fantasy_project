@@ -113,8 +113,8 @@ def render() -> None:
 
     with st.expander("How this works"):
         st.markdown(
-            "- **Per game:** adds up each player's per-game projection, as if everyone plays "
-            "that night.\n"
+            "- **Per game:** your team as one player, the average of your players' per-game "
+            "lines.\n"
             "- **Season totals:** adds up each player's projected season, so games played "
             "count in full.\n"
             "- **FG% and FT%:** come from the team's total makes and attempts.\n"

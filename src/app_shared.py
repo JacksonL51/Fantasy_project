@@ -10,6 +10,7 @@ import pandas as pd
 import streamlit as st
 
 from rankings import rank_players
+from team_analysis import average_player
 
 PROJECTIONS_PATH = (
     Path(__file__).resolve().parent.parent
@@ -278,12 +279,14 @@ def player_row_html(
     columns: list[dict[str, str]],
     current_sort: str | None = None,
     show_colors: bool = True,
+    row_class: str = "",
 ) -> str:
     """One player's table row. Names and teams are escaped; everything else is numeric."""
     note = f'<span class="tag">{html.escape(player["NOTE"])}</span>' if player["NOTE"] else ""
     name_sorted = " sorted" if current_sort == "PLAYER" else ""
+    rank = "" if player["RANK"] is None else int(player["RANK"])
     cells = [
-        f'<td class="rank">{int(player["RANK"])}</td>',
+        f'<td class="rank">{rank}</td>',
         f'<td class="player{name_sorted}"><span class="name">'
         f'{html.escape(str(player["PLAYER_NAME"]))}</span>{note}</td>',
         f'<td class="team">{html.escape(str(player["TEAM_ABBREVIATION"]))}</td>',
@@ -302,7 +305,7 @@ def player_row_html(
                 classes.append(tint)
         text = column["format"].format(player[column["key"]])
         cells.append(f'<td class="{" ".join(classes)}">{text}</td>')
-    return f"<tr>{''.join(cells)}</tr>"
+    return f'<tr class="{row_class}">{"".join(cells)}</tr>'
 
 
 def table_html(
@@ -363,9 +366,10 @@ def score_tint(score: float) -> str:
 
 
 def category_table_html(categories: pd.DataFrame, view: str) -> str:
-    """The team's nine categories, per game or in season totals."""
+    """The team's nine categories: as one average player per game, or in season totals."""
     per_game = view == PER_GAME
     column = "PER_GAME" if per_game else "TOTAL"
+    heading = "Per game (as one player)" if per_game else view
     rows = []
     for key, row in categories.iterrows():
         rows.append(
@@ -375,7 +379,7 @@ def category_table_html(categories: pd.DataFrame, view: str) -> str:
         )
     return (
         '<div class="stat-table compact" tabindex="0"><table><thead><tr>'
-        f'<th class="label">Category</th><th class="num">{html.escape(view)}</th>'
+        f'<th class="label">Category</th><th class="num">{html.escape(heading)}</th>'
         '<th class="num" title="Average of your players\' category scores, compared with players '
         'projected for 500+ minutes. Above 0 is better, including for turnovers">'
         f'Average player score</th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
@@ -390,9 +394,12 @@ def trade_table_html(
     moves: pd.Series,
     view: str,
 ) -> str:
-    """One table: the players in the trade, then the team's numbers under the same stats."""
+    """One table holding the players in the trade.
+
+    Per game adds each side as one average player. Season totals adds the team's before,
+    after and change under the same stats.
+    """
     per_game = view == PER_GAME
-    number = "PER_GAME" if per_game else "TOTAL"
     columns = table_columns(view)
     width = len(columns) + 3
 
@@ -420,17 +427,27 @@ def trade_table_html(
 
     def plain(frame: pd.DataFrame):
         def show(category: str) -> str:
-            value = frame.loc[category, number]
-            if per_game or category in ("FG", "FT"):
-                return f"{value:.1f}"
-            return f"{value:,.0f}"
+            value = frame.loc[category, "TOTAL"]
+            return f"{value:.1f}" if category in ("FG", "FT") else f"{value:,.0f}"
         return show
 
     def change(category: str) -> str:
-        value = after.loc[category, number] - before.loc[category, number]
-        if per_game or category in ("FG", "FT"):
-            return f"{value:+.1f}"
-        return f"{value:+,.0f}"
+        value = after.loc[category, "TOTAL"] - before.loc[category, "TOTAL"]
+        return f"{value:+.1f}" if category in ("FG", "FT") else f"{value:+,.0f}"
+
+    def side(title: str, rows: pd.DataFrame) -> list[str]:
+        if rows.empty:
+            return []
+        lines = [section(title)]
+        lines += [player_row_html(player, columns) for player in rows.to_dict("records")]
+        if per_game and len(rows) > 1:
+            average = {"RANK": None, "PLAYER_NAME": "Average", "TEAM_ABBREVIATION": "", "NOTE": ""}
+            lines.append(
+                player_row_html(
+                    {**average, **average_player(rows)}, columns, row_class="team-row change"
+                )
+            )
+        return lines
 
     head = [
         '<th class="rank" title="Overall fantasy rank">#</th>',
@@ -448,22 +465,17 @@ def trade_table_html(
             f'{column["label"]}</th>'
         )
 
-    body = []
-    if not giving.empty:
-        body.append(section("You give"))
-        body += [player_row_html(player, columns) for player in giving.to_dict("records")]
-    if not getting.empty:
-        body.append(section("You get"))
-        body += [player_row_html(player, columns) for player in getting.to_dict("records")]
-    body.append(section("Your team"))
-    body.append(team_row("Before", "team-row", plain(before)))
-    body.append(team_row("After", "team-row", plain(after)))
-    body.append(
-        team_row(
-            "Change", "team-row change", change,
-            tint=lambda category: score_tint(moves[category] * 2.0),
+    body = [*side("You give", giving), *side("You get", getting)]
+    if not per_game:
+        body.append(section("Your team"))
+        body.append(team_row("Before", "team-row", plain(before)))
+        body.append(team_row("After", "team-row", plain(after)))
+        body.append(
+            team_row(
+                "Change", "team-row change", change,
+                tint=lambda category: score_tint(moves[category] * 2.0),
+            )
         )
-    )
     return (
         '<div class="stat-table trade" tabindex="0"><table>'
         f'<thead><tr>{"".join(head)}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'

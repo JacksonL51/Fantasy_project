@@ -106,14 +106,19 @@ def render() -> None:
     view = view_col.segmented_control(
         "Stats", [PER_GAME, SEASON_TOTALS], default=PER_GAME, required=True
     )
-    moves = report.per_game_moves if view == PER_GAME else report.moves
     st.html(
-        trade_table_html(report.giving, report.getting, report.before, report.after, moves, view)
+        trade_table_html(
+            report.giving, report.getting, report.before, report.after, report.moves, view
+        )
     )
 
+    explanation = (
+        "Average shows each side as one player: the average of their per-game lines."
+        if view == PER_GAME
+        else "On the Change row, blue helps your team and red hurts it, including for turnovers."
+    )
     st.caption(
-        "On the Change row, blue helps your team and red hurts it, including for turnovers. "
-        "The verdict and the better and worse lists use season totals, so they count games "
-        "played and can differ from per-game changes. Stats are full-season projections, so "
-        "this doesn't adjust for games already played or current injuries."
+        f"{explanation} The verdict and the better and worse lists use season totals, so they "
+        "count games played. Stats are full-season projections, so this doesn't adjust for "
+        "games already played or current injuries."
     )
