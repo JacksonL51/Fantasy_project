@@ -43,7 +43,9 @@ Run everything from the project root.
      calls `rank_players` from `src/rankings.py` on the current projections.
    - My Team: draft tracker and team builder for the user's roster only (other teams are not
      tracked). Roster of 13; league size defaults to 10, from 6 to 16.
-   - Trade Analyzer: how a trade changes the user's team.
+   - Trade Analyzer: how a trade changes the user's team. One table holds the players in the
+     trade, with the team's before, after and change under the same stats, per game or in
+     season totals. The verdict always uses season totals.
 8. `src/team_analysis.py` — team stats, feedback and trade comparisons, with no Streamlit.
    There is deliberately no team-level baseline, grade or "typical team" (removed; the user may
    add one later with a real baseline). A category's score is the roster's average player score

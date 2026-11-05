@@ -113,6 +113,31 @@ class Trades(unittest.TestCase):
         report = analyze_trade(self.players, self.roster, self.roster[:2], [self.ids[0]], 10)
         self.assertEqual(report.replacements, 1)
         self.assertTrue(report.dropped.empty)
+        pool = self.players.sort_values("RANK").iloc[130:140]
+        rows = self.players.set_index("PLAYER_ID").loc[[*self.roster[2:], self.ids[0]]]
+        self.assertAlmostEqual(
+            report.after.loc["PTS", "PER_GAME"], rows["PROJ_PTS"].sum() + pool["PROJ_PTS"].mean()
+        )
+
+    def test_trade_reports_both_views(self):
+        report = analyze_trade(self.players, self.roster, [self.roster[0]], [self.ids[0]], 10)
+        rows = self.players.set_index("PLAYER_ID").loc[self.roster]
+        self.assertAlmostEqual(report.before.loc["AST", "PER_GAME"], rows["PROJ_AST"].sum())
+        self.assertAlmostEqual(report.before.loc["AST", "TOTAL"], rows["TOTAL_AST"].sum())
+        self.assertEqual(report.before.loc["FG", "PER_GAME"], report.before.loc["FG", "TOTAL"])
+        self.assertEqual(sorted(report.per_game_moves.index), sorted(report.moves.index))
+
+    def test_per_game_and_season_moves_can_disagree(self):
+        # A better per-game player who misses most of the season.
+        players = self.players.copy()
+        give, get = self.roster[0], self.ids[200]
+        given = players["PLAYER_ID"] == give
+        taken = players["PLAYER_ID"] == get
+        players.loc[taken, "PROJ_PTS"] = players.loc[given, "PROJ_PTS"].iloc[0] + 5
+        players.loc[taken, "TOTAL_PTS"] = players.loc[given, "TOTAL_PTS"].iloc[0] / 2
+        report = analyze_trade(players, self.roster, [give], [get], 10)
+        self.assertGreater(report.per_game_moves["PTS"], 0)
+        self.assertLess(report.moves["PTS"], 0)
 
     def test_one_for_two_drops_the_lowest_value_kept_player(self):
         report = analyze_trade(self.players, self.roster, [self.roster[0]], self.ids[:2], 10)

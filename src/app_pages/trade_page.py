@@ -4,11 +4,11 @@ import streamlit as st
 
 from app_shared import (
     PER_GAME,
+    SEASON_TOTALS,
     player_label,
     player_row,
     player_search,
     require_players,
-    table_html,
     trade_table_html,
 )
 from league_store import load_team
@@ -101,18 +101,19 @@ def render() -> None:
     if notes:
         st.markdown("\n".join(f"- {note}" for note in notes))
 
-    st.subheader("Your team's categories")
-    st.html(trade_table_html(report.before, report.after, report.moves))
-
-    st.subheader("Players in the trade")
-    if giving:
-        st.caption("You give")
-        st.html(table_html(players[players["PLAYER_ID"].isin(giving)], PER_GAME))
-    if getting:
-        st.caption("You get")
-        st.html(table_html(players[players["PLAYER_ID"].isin(getting)], PER_GAME))
+    title_col, view_col = st.columns([3, 1], vertical_alignment="bottom")
+    title_col.subheader("Trade details")
+    view = view_col.segmented_control(
+        "Stats", [PER_GAME, SEASON_TOTALS], default=PER_GAME, required=True
+    )
+    moves = report.per_game_moves if view == PER_GAME else report.moves
+    st.html(
+        trade_table_html(report.giving, report.getting, report.before, report.after, moves, view)
+    )
 
     st.caption(
-        "Stats are full-season projections, so this doesn't adjust for games already played "
-        "or current injuries."
+        "On the Change row, blue helps your team and red hurts it, including for turnovers. "
+        "The verdict and the better and worse lists use season totals, so they count games "
+        "played and can differ from per-game changes. Stats are full-season projections, so "
+        "this doesn't adjust for games already played or current injuries."
     )

@@ -153,7 +153,7 @@ def player_label(players: pd.DataFrame):
 
 def player_row(label: str, button: str, key: str, on_click, args: tuple, disabled: bool = False) -> None:
     """One player's line with an action button at the end."""
-    text_col, button_col = st.columns([5, 1], vertical_alignment="center")
+    text_col, button_col = st.columns([3, 1], vertical_alignment="center")
     text_col.markdown(label)
     button_col.button(
         button, key=key, on_click=on_click, args=args, disabled=disabled, width="stretch"
@@ -273,6 +273,38 @@ def header_cell(
     return f'<th class="{" ".join(classes)}" {" ".join(attributes)}>{label}</th>'
 
 
+def player_row_html(
+    player: dict,
+    columns: list[dict[str, str]],
+    current_sort: str | None = None,
+    show_colors: bool = True,
+) -> str:
+    """One player's table row. Names and teams are escaped; everything else is numeric."""
+    note = f'<span class="tag">{html.escape(player["NOTE"])}</span>' if player["NOTE"] else ""
+    name_sorted = " sorted" if current_sort == "PLAYER" else ""
+    cells = [
+        f'<td class="rank">{int(player["RANK"])}</td>',
+        f'<td class="player{name_sorted}"><span class="name">'
+        f'{html.escape(str(player["PLAYER_NAME"]))}</span>{note}</td>',
+        f'<td class="team">{html.escape(str(player["TEAM_ABBREVIATION"]))}</td>',
+    ]
+    for column in columns:
+        classes = ["num"]
+        if column.get("group"):
+            classes.append("group")
+        if column.get("class"):
+            classes.append(column["class"])
+        if column["sort"] == current_sort:
+            classes.append("sorted")
+        if show_colors and column.get("score"):
+            tint = tint_class(player[column["score"]])
+            if tint:
+                classes.append(tint)
+        text = column["format"].format(player[column["key"]])
+        cells.append(f'<td class="{" ".join(classes)}">{text}</td>')
+    return f"<tr>{''.join(cells)}</tr>"
+
+
 def table_html(
     frame: pd.DataFrame,
     view: str,
@@ -301,33 +333,10 @@ def table_html(
             classes.append(column["class"])
         head.append(head_cell(column["label"], classes, column["title"], column["sort"]))
 
-    rows = []
-    for player in frame.to_dict("records"):
-        note = (
-            f'<span class="tag">{html.escape(player["NOTE"])}</span>' if player["NOTE"] else ""
-        )
-        name_sorted = " sorted" if current_sort == "PLAYER" else ""
-        cells = [
-            f'<td class="rank">{int(player["RANK"])}</td>',
-            f'<td class="player{name_sorted}"><span class="name">'
-            f'{html.escape(str(player["PLAYER_NAME"]))}</span>{note}</td>',
-            f'<td class="team">{html.escape(str(player["TEAM_ABBREVIATION"]))}</td>',
-        ]
-        for column in columns:
-            classes = ["num"]
-            if column.get("group"):
-                classes.append("group")
-            if column.get("class"):
-                classes.append(column["class"])
-            if column["sort"] == current_sort:
-                classes.append("sorted")
-            if show_colors and column.get("score"):
-                tint = tint_class(player[column["score"]])
-                if tint:
-                    classes.append(tint)
-            text = column["format"].format(player[column["key"]])
-            cells.append(f'<td class="{" ".join(classes)}">{text}</td>')
-        rows.append(f"<tr>{''.join(cells)}</tr>")
+    rows = [
+        player_row_html(player, columns, current_sort, show_colors)
+        for player in frame.to_dict("records")
+    ]
 
     wrap_class = "stat-table fixed" if fixed_height else "stat-table"
     empty = (
@@ -373,24 +382,91 @@ def category_table_html(categories: pd.DataFrame, view: str) -> str:
     )
 
 
-def trade_table_html(before: pd.DataFrame, after: pd.DataFrame, moves: pd.Series) -> str:
-    """The user's nine categories before and after a trade."""
-    rows = []
-    for key, row in before.iterrows():
-        new = after.loc[key]
-        change = new["TOTAL"] - row["TOTAL"]
-        change_text = f"{change:+.1f}" if key in ("FG", "FT") else f"{change:+,.0f}"
-        rows.append(
-            f'<tr><td class="label">{html.escape(row["LABEL"])}</td>'
-            f'<td class="num">{category_number(key, row["TOTAL"])}</td>'
-            f'<td class="num">{category_number(key, new["TOTAL"])}</td>'
-            f'<td class="num {score_tint(moves[key] * 2.0)}">{change_text}</td></tr>'
+def trade_table_html(
+    giving: pd.DataFrame,
+    getting: pd.DataFrame,
+    before: pd.DataFrame,
+    after: pd.DataFrame,
+    moves: pd.Series,
+    view: str,
+) -> str:
+    """One table: the players in the trade, then the team's numbers under the same stats."""
+    per_game = view == PER_GAME
+    number = "PER_GAME" if per_game else "TOTAL"
+    columns = table_columns(view)
+    width = len(columns) + 3
+
+    def section(title: str) -> str:
+        return f'<tr class="section"><td colspan="{width}">{html.escape(title)}</td></tr>'
+
+    def team_row(label: str, row_class: str, text, tint=None) -> str:
+        cells = [
+            '<td class="rank"></td>',
+            f'<td class="player"><span class="name">{html.escape(label)}</span></td>',
+            '<td class="team"></td>',
+        ]
+        for column in columns:
+            classes = ["num"]
+            if column.get("group"):
+                classes.append("group")
+            content = ""
+            if column.get("score"):
+                category = column["score"].removeprefix("Z_")
+                content = text(category)
+                if tint:
+                    classes.append(tint(category))
+            cells.append(f'<td class="{" ".join(classes)}">{content}</td>')
+        return f'<tr class="{row_class}">{"".join(cells)}</tr>'
+
+    def plain(frame: pd.DataFrame):
+        def show(category: str) -> str:
+            value = frame.loc[category, number]
+            if per_game or category in ("FG", "FT"):
+                return f"{value:.1f}"
+            return f"{value:,.0f}"
+        return show
+
+    def change(category: str) -> str:
+        value = after.loc[category, number] - before.loc[category, number]
+        if per_game or category in ("FG", "FT"):
+            return f"{value:+.1f}"
+        return f"{value:+,.0f}"
+
+    head = [
+        '<th class="rank" title="Overall fantasy rank">#</th>',
+        '<th class="player">Player</th>',
+        '<th class="team">Team</th>',
+    ]
+    for column in columns:
+        classes = ["num"]
+        if column.get("group"):
+            classes.append("group")
+        if column.get("class"):
+            classes.append(column["class"])
+        head.append(
+            f'<th class="{" ".join(classes)}" title="{html.escape(column["title"])}">'
+            f'{column["label"]}</th>'
         )
+
+    body = []
+    if not giving.empty:
+        body.append(section("You give"))
+        body += [player_row_html(player, columns) for player in giving.to_dict("records")]
+    if not getting.empty:
+        body.append(section("You get"))
+        body += [player_row_html(player, columns) for player in getting.to_dict("records")]
+    body.append(section("Your team"))
+    body.append(team_row("Before", "team-row", plain(before)))
+    body.append(team_row("After", "team-row", plain(after)))
+    body.append(
+        team_row(
+            "Change", "team-row change", change,
+            tint=lambda category: score_tint(moves[category] * 2.0),
+        )
+    )
     return (
-        '<div class="stat-table compact" tabindex="0"><table><thead><tr>'
-        '<th class="label">Category</th><th class="num">Before</th><th class="num">After</th>'
-        '<th class="num" title="Blue helps your team, red hurts it, including for turnovers">'
-        f'Change</th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+        '<div class="stat-table trade" tabindex="0"><table>'
+        f'<thead><tr>{"".join(head)}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
     )
 
 
@@ -455,6 +531,11 @@ def page_css(theme_name: str) -> str:
 .stat-table.compact .num {{ width: auto; }}
 .stat-table.compact .label {{ font-weight: 600; }}
 .stat-table.compact .muted {{ color: {t["muted"]}; }}
+.stat-table.trade .section td {{
+  padding: 7px 8px; color: {t["muted"]}; font-size: 12px; font-weight: 600;
+  letter-spacing: 0.02em; background: {t["tag"]};
+}}
+.stat-table.trade .change td {{ font-weight: 700; }}
 .player-list {{
   height: {PLAYER_LIST_HEIGHT_PX}px; overflow-y: auto; box-sizing: border-box;
   background: {t["surface"]}; color: {t["ink"]}; font-size: 14px;
