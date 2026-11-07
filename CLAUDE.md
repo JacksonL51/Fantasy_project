@@ -34,12 +34,33 @@ Run everything from the project root.
    go uncounted as a result; never discounting turnovers was tried and rejected because it
    moved guards too far (Cunningham 7 -> 23). The backtest still scores the plain season-total
    sum, so the two values differ on purpose. Still to be refined.
-7. `src/dashboard.py` — read-only Streamlit view of `projections_by_team.csv` (top 10, full
-   rankings, search, team filter, click-a-header sorting, category color switch). Needs
-   Streamlit 1.66+. The full table keeps a fixed height so searching never moves the page.
-   `streamlit run src/dashboard.py`. It only displays
-   ranks and value, calling `rank_players` from `src/rankings.py` on the current projections,
-   so tune the ranking logic there, not here.
+7. `src/dashboard.py` — Streamlit entry point and page menu; needs Streamlit 1.66+.
+   `streamlit run src/dashboard.py`. Pages live in `src/app_pages/`; `src/app_shared.py` holds
+   their data loading, tables and styling. Pages only display results, so tune logic in the
+   modules below, not in pages. Restart Streamlit after editing imported modules.
+   - Rankings: top 10, full rankings, search, team filter, click-a-header sorting, category
+     color switch. The full table keeps a fixed height so searching never moves the page. It
+     calls `rank_players` from `src/rankings.py` on the current projections.
+   - My Team: draft tracker and team builder for the user's own named teams (other league
+     teams are not tracked). Roster of 13; league size is per team, defaults to 10, from 6 to 16.
+   - Trade Analyzer: how a trade changes the user's team. One table holds the players in the
+     trade. Per game adds an Average row for a side with 2+ players (the side as one player,
+     with percentages from combined makes and attempts); season totals adds the team's before,
+     after and change. The verdict always uses season totals. My Team's per-game categories
+     also show the team as one average player.
+8. `src/team_analysis.py` — team stats, feedback and trade comparisons, with no Streamlit.
+   There is deliberately no team-level baseline, grade or "typical team" (removed; the user may
+   add one later with a real baseline). A category's score is the roster's average player score
+   from `rankings.py`, and strongest/weakest categories are ranked within the team. Trade
+   verdicts weigh each category's season-total change by how much rostered players differ in
+   it, which is where league size matters. Uneven trades: extras drop the lowest-value kept
+   player; open spots get the average of the next 10 unrostered players. All bands are judgment
+   calls. No rest-of-season scaling or current injuries yet.
+9. `src/league_store.py` — saves named teams to `data/league/teams.json` (git-ignored; the
+   pipeline never touches it). The older `my_team.json` is read once as Team1 if `teams.json`
+   doesn't exist yet. New teams stay in the session until saved; saved teams then save every
+   change right away. Default names are the first free Team1, Team2 and so on, and names are
+   unique. The Trade Analyzer picks which team to use, including an unsaved one. Tests: `python -m unittest discover tests`.
 `src/history.py` is shared (rate-history features, age/role MPG curves, production
 score, fitted games model). Its features must be computed identically in training and
 projection.
