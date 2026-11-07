@@ -34,3 +34,6 @@ Thumbs.db
 
 # Saved fantasy team (personal, created by the app)
 data/league/
+
+CLAUDE.md
+nba_fantasy_basketball_mvp_architecture_roadmap.md
