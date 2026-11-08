@@ -846,6 +846,16 @@ def _score_rookie_class(
     slot_only = R.predict_rookies(
         R.fit_rookie_models(train, M.TARGET_STATS, use_opportunity=False), test, league_prev
     )
+    # Without the picks 4-15 MPG correction, to show what it adds.
+    no_pick_fix = R.predict_rookies(
+        R.fit_rookie_models(train, M.TARGET_STATS, use_pick_correction=False), test, league_prev
+    )
+    low, high = R.PICK_CORRECTION_RANGE
+    lottery = test["OVERALL_PICK"].between(low, high)
+    # Layers 1-2 rates (no college stats or height), to show what layer 3 adds.
+    no_college = R.predict_rookies(
+        R.fit_rookie_models(train, M.TARGET_STATS, use_college=False), test, league_prev
+    )
     replacement_rates = pd.DataFrame(
         np.tile(replacement.reindex(M.TARGET_STATS).to_numpy(), (len(test), 1)),
         index=test.index, columns=M.TARGET_STATS,
@@ -864,6 +874,22 @@ def _score_rookie_class(
         "MPG_MAE_draft": float(np.mean(np.abs(test["MPG"] - pred["MPG"]))),
         "MPG_MAE_typical_rookie": float(np.mean(np.abs(test["MPG"] - mean_mpg))),
         "MPG_MAE_slot_only": float(np.mean(np.abs(test["MPG"] - slot_only["MPG"]))),
+        "MPG_MAE_no_pick_fix": float(np.mean(np.abs(test["MPG"] - no_pick_fix["MPG"]))),
+        "Picks4_15_MPG_MAE_draft": float(np.mean(np.abs(test["MPG"] - pred["MPG"])[lottery])),
+        "Picks4_15_MPG_MAE_no_pick_fix": float(np.mean(np.abs(test["MPG"] - no_pick_fix["MPG"])[lottery])),
+        "Picks4_15_SEASON_MIN_MAE_draft": float(
+            np.mean(np.abs(actual_min_82 - pred["MPG"] * pred["GAMES_82"])[lottery])
+        ),
+        "Picks4_15_SEASON_MIN_MAE_no_pick_fix": float(
+            np.mean(np.abs(actual_min_82 - no_pick_fix["MPG"] * no_pick_fix["GAMES_82"])[lottery])
+        ),
+        "Picks4_15_SEASON_MIN_miss_draft": float(
+            np.mean((actual_min_82 - pred["MPG"] * pred["GAMES_82"])[lottery])
+        ),
+        "Picks4_15_SEASON_MIN_miss_no_pick_fix": float(
+            np.mean((actual_min_82 - no_pick_fix["MPG"] * no_pick_fix["GAMES_82"])[lottery])
+        ),
+        "Pick_MPG_shift": float(models["pick_mpg_shift"]),
         "GAMES_MAE_slot_only": float(np.mean(np.abs(test["GAMES_82"] - slot_only["GAMES_82"]))),
         "SEASON_MIN_MAE_slot_only": float(
             np.mean(np.abs(actual_min_82 - slot_only["MPG"] * slot_only["GAMES_82"]))
@@ -882,6 +908,12 @@ def _score_rookie_class(
     result.update(_rate_metrics(test.loc[rated], pred.loc[rated], test.loc[rated, "MIN"], "draft_"))
     result.update(
         _rate_metrics(test.loc[rated], replacement_rates.loc[rated], test.loc[rated, "MIN"], "replacement_")
+    )
+    result.update(
+        _rate_metrics(test.loc[rated], no_college.loc[rated], test.loc[rated, "MIN"], "no_college_")
+    )
+    result["VALUE_Spearman_no_college"] = _value_spearman(
+        test, no_college, pred["MPG"], pred["GAMES_82"]
     )
     result.update(
         _second_year_test(year, history, draft, pairs, decisions, models, replacement, league_prev)
@@ -915,11 +947,15 @@ def _rookie_summary(results: pd.DataFrame) -> dict:
                    ("GAMES_MAE_draft", "GAMES_MAE_typical_rookie"),
                    ("SEASON_MIN_MAE_draft", "SEASON_MIN_MAE_typical_rookie"),
                    ("MPG_MAE_draft", "MPG_MAE_slot_only"),
+                   ("MPG_MAE_draft", "MPG_MAE_no_pick_fix"),
+                   ("Picks4_15_MPG_MAE_draft", "Picks4_15_MPG_MAE_no_pick_fix"),
+                   ("Picks4_15_SEASON_MIN_MAE_draft", "Picks4_15_SEASON_MIN_MAE_no_pick_fix"),
                    ("GAMES_MAE_draft", "GAMES_MAE_slot_only"),
                    ("SEASON_MIN_MAE_draft", "SEASON_MIN_MAE_slot_only")]
     for stat in M.TARGET_STATS + ["FG_PCT", "FT_PCT"]:
         suffix = "_MAE" if stat.endswith("_PCT") else "_MAE36"
         comparisons.append((f"draft_{stat}{suffix}", f"replacement_{stat}{suffix}"))
+        comparisons.append((f"draft_{stat}{suffix}", f"no_college_{stat}{suffix}"))
         if f"SecondYear_draft_{stat}{suffix}" in results.columns:
             comparisons.append((f"SecondYear_draft_{stat}{suffix}", f"SecondYear_replacement_{stat}{suffix}"))
     for new, old in comparisons:
@@ -948,13 +984,14 @@ def run_rookies(first_class: int = ROOKIE_FIRST_CLASS) -> None:
 
     show = ["Class", "Rookies", "MPG_MAE_draft", "MPG_MAE_slot_only", "MPG_MAE_typical_rookie",
             "GAMES_MAE_draft", "GAMES_MAE_slot_only", "GAMES_MAE_current",
-            "VALUE_Spearman_draft", "VALUE_Spearman_pick_order"]
+            "VALUE_Spearman_draft", "VALUE_Spearman_no_college", "VALUE_Spearman_pick_order"]
     print("\nRookie classes (draft prior vs baselines):")
     print(results[show].round(3).to_string(index=False))
     print("\nPer-36 rate error, rookies with 200+ minutes (draft prior vs replacement):")
     rate_table = pd.DataFrame(
         {
             "draft": [summary["metrics"][f"draft_{s}_MAE36"] for s in M.TARGET_STATS],
+            "no_college": [summary["metrics"][f"no_college_{s}_MAE36"] for s in M.TARGET_STATS],
             "replacement": [summary["metrics"][f"replacement_{s}_MAE36"] for s in M.TARGET_STATS],
             "2nd_yr_draft": [summary["metrics"].get(f"SecondYear_draft_{s}_MAE36") for s in M.TARGET_STATS],
             "2nd_yr_replacement": [summary["metrics"].get(f"SecondYear_replacement_{s}_MAE36") for s in M.TARGET_STATS],
@@ -975,6 +1012,7 @@ def run_rookies(first_class: int = ROOKIE_FIRST_CLASS) -> None:
 ALLOCATION_RESULTS_PATH = M.PROCESSED_DIR / "allocation_backtest_results.csv"
 ALLOCATION_PLAYERS_PATH = M.PROCESSED_DIR / "allocation_backtest_players.csv"
 TEAM_CROWD_SHRINK_GRID = (0.5, 1.0)
+QUALITY_BETA_GRID = (0.5, 1.0, 1.5, 2.0)
 ALLOCATION_VARIANTS = {
     "current": {"rookie_method": "draft", "position_method": "fitted", "team_crowd_method": "none"},
     "no_position": {"rookie_method": "draft", "position_method": "none", "team_crowd_method": "none"},
@@ -992,6 +1030,25 @@ ALLOCATION_VARIANTS = {
             "team_crowd_method": "fitted", "team_crowd_shrink": shrink,
         }
         for shrink in TEAM_CROWD_SHRINK_GRID
+    },
+    # Thin-roster fixes: each one switched off in turn, and the quality-aware budget.
+    "no_minutes_shrink": {"rookie_method": "draft", "position_method": "fitted",
+                          "team_crowd_method": "none", "minutes_shrink": "none"},
+    "no_rookie_team_quality": {"rookie_method": "draft", "position_method": "fitted",
+                               "team_crowd_method": "none", "rookie_team_quality": False},
+    "no_rookie_playmaker": {"rookie_method": "draft", "position_method": "fitted",
+                            "team_crowd_method": "none", "rookie_playmaker": False},
+    "soft_budget": {"rookie_method": "draft", "position_method": "fitted",
+                    "team_crowd_method": "none", "allocation_method": "soft"},
+    "soft_budget_no_playmaker": {"rookie_method": "draft", "position_method": "fitted",
+                                 "team_crowd_method": "none", "allocation_method": "soft",
+                                 "rookie_playmaker": False},
+    **{
+        f"quality_{beta:g}": {
+            "rookie_method": "draft", "position_method": "fitted", "team_crowd_method": "none",
+            "allocation_method": "quality", "quality_beta": beta,
+        }
+        for beta in QUALITY_BETA_GRID
     },
 }
 

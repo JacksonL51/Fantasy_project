@@ -164,5 +164,8 @@ def render() -> None:
             "that category. For turnovers, blue means fewer.\n"
             "- **Bench players:** their minutes are what remains after each team's top nine, "
             "so read their lines loosely.\n"
-            "- **No NBA history:** these players get replacement-level stats."
+            "- **Rookies:** projected from draft pick, age, college stats, height and team "
+            "opportunity; see the Rookies page.\n"
+            "- **No recent NBA seasons:** players back after years away get replacement-level "
+            "stats."
         )

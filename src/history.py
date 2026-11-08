@@ -682,3 +682,51 @@ def team_mpg_adjustment(model: dict, total: pd.Series, shrink: float) -> pd.Seri
     centered = pd.to_numeric(total, errors="coerce") - model["team_mean"]
     change = shrink * model["team_coef"] * centered
     return change.clip(-TEAM_CROWD_CLIP, TEAM_CROWD_CLIP).fillna(0.0)
+
+
+# --------------------------------------------------------------------------
+# Small-sample shrink for baseline MPG
+# --------------------------------------------------------------------------
+# A baseline from a short career (a stint on a tanking team, a partial season) overstates
+# next season's MPG. Baseline MPG is pulled toward the typical next-season MPG of players
+# whose baseline rests on few games, with weight min(1, career minutes / 1,500). Career
+# minutes, not recent games, so stars back from injury are left alone. Held-out seasons
+# 2014-26 (returning players' MPG error): none 4.56, this 4.48; 28+ MPG baselines 3.06 ->
+# 3.06; 20+ MPG from under 60 games 6.96 -> 6.47. A games-based weight (games / (games +
+# 20)) hurt stars (3.06 -> 3.17; starters' season-minute error 457 -> 478 on rebuilt
+# rosters). 1,500 matches the old anchored allocation's credibility, which the soft
+# budget had dropped.
+MPG_SHRINK_CAREER_MINUTES = 1500.0
+MPG_SHRINK_FEW_GAMES = 60  # baselines from fewer games set the shrink target
+
+
+def fit_minutes_shrink(history: pd.DataFrame, career_minutes: float = MPG_SHRINK_CAREER_MINUTES) -> dict:
+    """Shrink target: average next-season MPG of players whose baseline rests on few games.
+
+    Uses consecutive seasons in `history` only (pass past-only history in backtests).
+    """
+    h = history[["PLAYER_ID", "SEASON_YEAR", "GP", "MIN"]].copy()
+    h["MPG"] = h["MIN"] / h["GP"]
+    years = sorted(h["SEASON_YEAR"].unique())
+    targets = []
+    for year in years[3:]:
+        window = h.loc[(h["SEASON_YEAR"] >= year - 3) & (h["SEASON_YEAR"] < year) & (h["GP"] >= 15)]
+        played = window.groupby("PLAYER_ID")["GP"].sum()
+        few = played.index[played < MPG_SHRINK_FEW_GAMES]
+        nxt = h.loc[(h["SEASON_YEAR"] == year) & h["PLAYER_ID"].isin(few), "MPG"]
+        targets.extend(nxt.tolist())
+    if career_minutes <= 0 or len(targets) < 100:
+        return {"active": False, "career_minutes": career_minutes, "target": float("nan"), "n": len(targets)}
+    return {
+        "active": True, "career_minutes": float(career_minutes),
+        "target": round(float(np.mean(targets)), 3), "n": len(targets),
+    }
+
+
+def shrink_baseline_mpg(model: dict, mpg: pd.Series, career_minutes: pd.Series) -> pd.Series:
+    """Baseline MPG pulled toward the shrink target by min(1, career minutes / K)."""
+    if not model.get("active", False):
+        return mpg
+    career = pd.to_numeric(career_minutes, errors="coerce").fillna(0.0)
+    weight = (career / model["career_minutes"]).clip(0.0, 1.0)
+    return weight * mpg + (1.0 - weight) * model["target"]

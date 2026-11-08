@@ -1,4 +1,4 @@
-"""The fantasy app: rankings, a team builder and a trade analyzer.
+"""The fantasy app: rankings, rookies, a team builder and a trade analyzer.
 
 Run from the project root:
     streamlit run src/dashboard.py
@@ -11,7 +11,7 @@ src/league_store.py). Rerun project.py, then refresh the page, to see new projec
 
 import streamlit as st
 
-from app_pages import rankings_page, team_page, trade_page
+from app_pages import rankings_page, rookies_page, team_page, trade_page
 from app_shared import current_theme, page_css
 
 
@@ -21,6 +21,7 @@ def main() -> None:
     page = st.navigation(
         [
             st.Page(rankings_page.render, title="Rankings", url_path="rankings", default=True),
+            st.Page(rookies_page.render, title="Rookies", url_path="rookies"),
             st.Page(team_page.render, title="My Team", url_path="my-team"),
             st.Page(trade_page.render, title="Trade Analyzer", url_path="trade"),
         ],
