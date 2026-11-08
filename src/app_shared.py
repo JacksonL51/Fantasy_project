@@ -118,7 +118,10 @@ def plain_text(text: str) -> str:
 
 def data_note(row: pd.Series) -> str:
     if row["NO_PRIOR_DATA"]:
-        return "No NBA history"
+        if row.get("ROOKIE_PRIOR", False) == True:  # noqa: E712 (numpy bools)
+            pick = row.get("DRAFT_PICK")
+            return f"Rookie, pick {int(pick)}" if pd.notna(pick) else "Rookie, undrafted"
+        return "No recent NBA seasons"
     if row["STALE_DATA"]:
         return "Missed last season"
     return ""

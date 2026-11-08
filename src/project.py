@@ -54,6 +54,7 @@ from model import (
     load_model_bundle,
     predict_rates,
 )
+import rookies as R
 
 PROJECT_ROOT = PROCESSED_DIR.parents[1]
 ROSTERS_PATH = PROJECT_ROOT / "data" / "raw" / "current_rosters.csv"
@@ -104,6 +105,20 @@ RECENCY_WEIGHTS = {0: 0.60, 1: 0.27, 2: 0.13}
 #                 "fitted" = ridge model of next-season games (history.py)
 MPG_ADJUSTMENT = "age"
 GAMES_METHOD = "fitted"
+# ROOKIE_METHOD: "draft"       = draft slot and age prior (rookies.py) for rookies'
+#                                rates, MPG and games, and as the shrinkage target
+#                                for early-career players with small samples
+#                "replacement" = old behavior (replacement rates, floor MPG, typical games)
+ROOKIE_METHOD = "draft"
+# Players who debuted in the latest this-many seasons shrink toward their rookie
+# prior instead of replacement level when their sample is small.
+EARLY_CAREER_SEASONS = 2
+# Stats whose rookie rates come from the draft prior; the rest stay at replacement.
+# User's choice: all stats. Rookie backtest, classes 2016-26 (per-36 error): the
+# prior beat replacement in 8+ of 11 classes for FGM, FGA, FG3M, FTM, FTA, REB,
+# BLK and PTS, but AST (1 of 11, 3.7% worse) and STL (3 of 11, 3.1% worse) lost
+# and TOV was a toss-up (7 of 11). To drop those three, remove them from this list.
+ROOKIE_RATE_STATS = list(TARGET_STATS)
 
 # Expected Games Played priors
 DEFAULT_STARTER_GP = 68.0
@@ -417,16 +432,134 @@ def build_inference_table(
 
 
 # --------------------------------------------------------------------------
+# Rookie priors (draft slot and age; see rookies.py)
+# --------------------------------------------------------------------------
+def rookie_priors(
+    table: pd.DataFrame,
+    history: pd.DataFrame,
+    draft: pd.DataFrame | None = None,
+    current_ages: pd.Series | None = None,
+) -> pd.DataFrame:
+    """Rookie prior rates, MPG and GAMES_82 for every row of `table`.
+
+    Models are fit on rookie seasons in `history` only, and rates are scaled by
+    the latest season's league rates, so a past-only history gives a leak-free
+    prior. Rows with no usable prior have HAS_ROOKIE_PRIOR = False.
+    """
+    draft = R.load_draft_history() if draft is None else draft
+    current_ages = R.load_rookie_ages() if current_ages is None else current_ages
+    seasons = R.rookie_seasons(history, draft, TARGET_STATS)
+    models = R.fit_rookie_models(seasons, TARGET_STATS)
+    league = R.league_rates(history, TARGET_STATS).iloc[-1]
+    features = R.prior_features(table["PLAYER_ID"], history, draft, current_ages)
+    priors = R.predict_rookies(models, features, league)
+    priors["OVERALL_PICK"] = features["OVERALL_PICK"]
+    priors["HAS_ROOKIE_PRIOR"] = features["HAS_ROOKIE_PRIOR"]
+    # A true rookie has no NBA season at all. "No prior data" in the table also
+    # covers veterans back after 3+ seasons away (outside the recent window).
+    priors["ROOKIE"] = table["NO_PRIOR_DATA"] & ~features["NBA_HISTORY"]
+    print(
+        f"Rookie models: {models['rows']} rookie seasons "
+        f"({models['rate_rows']} with 200+ minutes for rates), classes through "
+        f"{models['last_class']}"
+    )
+    return priors
+
+
+def early_career(table: pd.DataFrame, latest_year: int) -> pd.Series:
+    """Players who debuted in the latest EARLY_CAREER_SEASONS seasons."""
+    first_year = pd.to_numeric(table.get("CAREER_FIRST_YEAR"), errors="coerce")
+    return (
+        ~table["NO_PRIOR_DATA"]
+        & first_year.ge(latest_year - EARLY_CAREER_SEASONS + 1).fillna(False)
+    )
+
+
+def shrink_targets(
+    table: pd.DataFrame,
+    replacement: pd.Series,
+    priors: pd.DataFrame | None,
+    latest_year: int,
+) -> pd.DataFrame:
+    """Per-player rates that small samples are blended toward.
+
+    Replacement level for everyone, except rookies and early-career players
+    with a rookie prior, who use that prior for ROOKIE_RATE_STATS.
+    Sets table["ROOKIE_PRIOR"].
+    """
+    targets = pd.DataFrame(
+        np.tile(replacement.reindex(TARGET_STATS).to_numpy(), (len(table), 1)),
+        index=table.index,
+        columns=TARGET_STATS,
+    )
+    use_prior = pd.Series(False, index=table.index)
+    if priors is not None:
+        use_prior = priors["HAS_ROOKIE_PRIOR"] & (
+            priors["ROOKIE"] | early_career(table, latest_year)
+        )
+        targets.loc[use_prior, ROOKIE_RATE_STATS] = priors.loc[use_prior, ROOKIE_RATE_STATS]
+    table["ROOKIE_PRIOR"] = use_prior
+    table["DRAFT_PICK"] = priors["OVERALL_PICK"] if priors is not None else np.nan
+    return targets
+
+
+def apply_rookie_minutes_and_games(
+    table: pd.DataFrame,
+    active_mpg: pd.Series,
+    proj_gp: pd.Series,
+    priors: pd.DataFrame | None,
+    latest_year: int,
+) -> tuple[pd.Series, pd.Series]:
+    """Rookies get prior MPG and games; early-career players with no 15-game
+    season get prior MPG. Also sets ALLOCATION_SEASON_MINUTES and
+    ROOKIE_MINUTES_PRIOR for the team allocation.
+    """
+    active_mpg = active_mpg.copy()
+    proj_gp = proj_gp.copy()
+    table["ALLOCATION_SEASON_MINUTES"] = table["WEIGHTED_SEASON_MINUTES"].fillna(0.0)
+    table["ROOKIE_MINUTES_PRIOR"] = False
+    if priors is None:
+        return active_mpg, proj_gp
+    has_prior = priors["HAS_ROOKIE_PRIOR"]
+    rookie = priors["ROOKIE"] & has_prior
+    no_mpg_yet = (
+        has_prior
+        & early_career(table, latest_year)
+        & table["ELIGIBLE_MPG_SEASONS"].fillna(0).eq(0)
+    )
+    mpg_rows = rookie | no_mpg_yet
+    active_mpg.loc[mpg_rows] = priors.loc[mpg_rows, "MPG"].clip(
+        MIN_HEALTHY_MPG, MAX_HEALTHY_MPG
+    )
+    proj_gp.loc[rookie] = priors.loc[rookie, "GAMES_82"]
+    # Predicted season minutes let a high pick claim a top-nine slot; the
+    # allocation takes them at full credibility (they are already a model prior).
+    table.loc[rookie, "ALLOCATION_SEASON_MINUTES"] = (
+        active_mpg.loc[rookie] * proj_gp.loc[rookie]
+    )
+    table.loc[rookie, "ROOKIE_MINUTES_PRIOR"] = True
+    print(
+        f"Rookie prior: {int(rookie.sum())} rookies; {int(no_mpg_yet.sum())} "
+        "early-career players use prior MPG"
+    )
+    return active_mpg, proj_gp
+
+
+# --------------------------------------------------------------------------
 # Steps 2-3: rate predictions with credibility blending
 # --------------------------------------------------------------------------
 def predict_with_credibility(
-    bundle: dict[str, object], table: pd.DataFrame, replacement: pd.Series
+    bundle: dict[str, object],
+    table: pd.DataFrame,
+    replacement: pd.Series | pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Model rates blended toward replacement for small or stale samples.
+    """Model rates blended toward a shrinkage target for small or stale samples.
 
     weight = clip(MIN_prior / 200, 0, 1). Stale rows are capped at 0.85, or at 0.5
     for players aged 31+ in their last season played.
-    Rookies have MIN_prior = 0, so they get pure replacement rates.
+    `replacement` is one rate per stat (Series, same for everyone) or a per-row
+    DataFrame (see shrink_targets). Rookies have MIN_prior = 0, so they get the
+    target rates exactly.
     """
     predicted = predict_rates(bundle, table)
     short = table["SHORT_SEASON_RETURN"]
@@ -457,15 +590,19 @@ def predict_with_credibility(
     )
     weight = weight.where(~table["STALE_DATA"], np.minimum(weight, stale_cap))
 
+    if isinstance(replacement, pd.DataFrame):
+        target = replacement.loc[table.index, TARGET_STATS].to_numpy(dtype=float)
+    else:
+        target = np.tile(replacement.reindex(TARGET_STATS).to_numpy(dtype=float), (len(table), 1))
     replacement_matrix = pd.DataFrame(
-        np.outer(1.0 - weight.to_numpy(), replacement.reindex(TARGET_STATS).to_numpy()),
+        (1.0 - weight.to_numpy())[:, None] * target,
         index=table.index,
         columns=TARGET_STATS,
     )
     blended = (predicted[TARGET_STATS].mul(weight, axis=0) + replacement_matrix).clip(
         lower=0.0
     )
-    print(f"Players blended toward replacement (weight < 1): {int((weight < 1).sum())}")
+    print(f"Players blended toward their shrinkage target (weight < 1): {int((weight < 1).sum())}")
     return blended, weight
 
 
@@ -654,6 +791,7 @@ def allocate_team_season_minutes(
     prior_career_minutes: np.ndarray,
     ages: np.ndarray,
     target_total: float = TEAM_SEASON_MINUTES,
+    minutes_from_model: np.ndarray | None = None,
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -667,6 +805,8 @@ def allocate_team_season_minutes(
     Anchor the top-nine healthy-MPG core and distribute remaining minutes by
     weighted-minute baseline. This keeps injury-shortened seasons from demoting
     established high-MPG players into the 12-MPG fringe pool.
+    `minutes_from_model` (bool per player) marks season minutes that are a model
+    prior (rookies); those are not blended again toward the cohort prior.
     """
     active_mpg = np.asarray(active_mpg, dtype=float)
     proj_gp = np.asarray(proj_gp, dtype=float)
@@ -746,6 +886,8 @@ def allocate_team_season_minutes(
         prior_career_minutes[tier4_indices]
         / MINUTES_CREDIBILITY_CAREER_MINUTES,
     )
+    if minutes_from_model is not None:
+        credibility[np.asarray(minutes_from_model, dtype=bool)] = 1.0
     minute_baseline[tier4_indices] = (
         credibility[tier4_indices] * weighted_season_minutes[tier4_indices]
         + (1.0 - credibility[tier4_indices]) * tier4_cohort_prior
@@ -836,13 +978,23 @@ def allocate_all_teams(
     norm_season_min = pd.Series(np.nan, index=table.index, name="PROJECTED_SEASON_MIN")
     final_gp = pd.Series(np.nan, index=table.index, name="PROJECTED_GP")
 
+    minutes_column = (
+        "ALLOCATION_SEASON_MINUTES"
+        if "ALLOCATION_SEASON_MINUTES" in table.columns
+        else "WEIGHTED_SEASON_MINUTES"
+    )
+    from_model = (
+        table["ROOKIE_MINUTES_PRIOR"].eq(True)
+        if "ROOKIE_MINUTES_PRIOR" in table.columns
+        else pd.Series(False, index=table.index)
+    )
     for team, index in table.groupby("TEAM_ABBREVIATION").groups.items():
         try:
             m, s, gp, tiers, baseline, credibility, cohort_prior = (
                 allocate_team_season_minutes(
                     active_mpg.loc[index].to_numpy(),
                     proj_gp.loc[index].to_numpy(),
-                    table.loc[index, "WEIGHTED_SEASON_MINUTES"]
+                    table.loc[index, minutes_column]
                     .fillna(0.0)
                     .to_numpy(),
                     table.loc[index, "PRIOR_CAREER_MINUTES"]
@@ -851,6 +1003,7 @@ def allocate_all_teams(
                     pd.to_numeric(
                         table.loc[index, "AGE"], errors="coerce"
                     ).to_numpy(),
+                    minutes_from_model=from_model.loc[index].to_numpy(),
                 )
             )
         except ValueError as error:
@@ -920,6 +1073,8 @@ def synthesize_stats(
     projections["STALE_DATA"] = table["STALE_DATA"]
     projections["SHORT_SEASON_RETURN"] = table["SHORT_SEASON_RETURN"]
     projections["MPG_BLENDED"] = mpg_blended
+    projections["ROOKIE_PRIOR"] = table.get("ROOKIE_PRIOR", False)
+    projections["DRAFT_PICK"] = table.get("DRAFT_PICK", np.nan)
     projections["LAST_PTS_PG"] = table["PTS_RATE"] * table["MIN"] / table["GP"]
     
     return projections
@@ -997,8 +1152,15 @@ def main() -> None:
     latest, latest_year = latest_season_rows(history)
     replacement = replacement_rates(latest, latest_year, bundle)
     table = build_inference_table(roster, latest, latest_year, replacement)
+    if ROOKIE_METHOD == "draft":
+        priors = rookie_priors(table, history)
+    elif ROOKIE_METHOD == "replacement":
+        priors = None
+    else:
+        raise ValueError(f"Unknown ROOKIE_METHOD: {ROOKIE_METHOD}")
+    targets = shrink_targets(table, replacement, priors, latest_year)
 
-    rates, weight = predict_with_credibility(bundle, table, replacement)
+    rates, weight = predict_with_credibility(bundle, table, targets)
     curve = fit_minutes_curve(history)
     print(f"MPG adjustment ({MPG_ADJUSTMENT}): {curve}")
     active_mpg, model_gp, mpg_blended = raw_minutes_and_gp(table, curve)
@@ -1012,6 +1174,9 @@ def main() -> None:
         proj_gp = fitted_games(table, games_model, proj_gp)
     elif GAMES_METHOD != "blend":
         raise ValueError(f"Unknown GAMES_METHOD: {GAMES_METHOD}")
+    active_mpg, proj_gp = apply_rookie_minutes_and_games(
+        table, active_mpg, proj_gp, priors, latest_year
+    )
     mpg, season_min, proj_gp = allocate_all_teams(table, active_mpg, proj_gp)
     projections = synthesize_stats(table, rates, active_mpg, proj_gp, mpg, season_min, weight, mpg_blended)
 
@@ -1046,6 +1211,8 @@ def main() -> None:
         "STALE_DATA",
         "SHORT_SEASON_RETURN",
         "MPG_BLENDED",
+        "ROOKIE_PRIOR",
+        "DRAFT_PICK",
         "LAST_PTS_PG",
     ]
     metadata_columns = [

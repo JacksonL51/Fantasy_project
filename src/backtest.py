@@ -1,7 +1,10 @@
 """Backtest games-played blends and fantasy rank accuracy by target season.
 
 Run from the project root with no year to evaluate the latest three seasons,
-or pass one season-ending year (for example 2024).
+or pass one season-ending year (for example 2024). Both forms also run the
+rookie backtest; `python src/backtest.py rookies` runs only that (each rookie
+class from 2016 on predicted from earlier classes, against replacement-level
+rates, a typical-rookie MPG and games line, and pick order).
 
 Rate-policy choices are loaded from the project metadata and may have been
 selected using folds that include a backtest target year; treat value-rank
@@ -17,6 +20,7 @@ from scipy.stats import spearmanr
 
 import model as M
 import project as P
+import rookies as R
 from history import fit_age_mpg_curve, fit_games_model, fit_role_curve
 
 MIN_ACTUAL_MINUTES = 500.0
@@ -654,5 +658,231 @@ def run(year: int | None = None) -> None:
     )
 
 
+# --------------------------------------------------------------------------
+# Rookie backtest: hold out each rookie class, predict it from earlier classes
+# --------------------------------------------------------------------------
+ROOKIE_FIRST_CLASS = 2016
+ROOKIE_RESULTS_PATH = M.PROCESSED_DIR / "rookie_backtest_results.csv"
+ROOKIE_PLAYERS_PATH = M.PROCESSED_DIR / "rookie_backtest_players.csv"
+ROOKIE_SUMMARY_PATH = M.PROCESSED_DIR / "rookie_backtest_summary.json"
+PER_36 = 36.0
+
+
+def _weighted_mae(actual, predicted, weight) -> float:
+    return float(np.average(np.abs(np.asarray(actual) - np.asarray(predicted)), weights=weight))
+
+
+def _rate_metrics(actual: pd.DataFrame, rates: pd.DataFrame, weight: pd.Series, prefix: str) -> dict:
+    """Per-36 rate MAE per stat, plus FG% and FT% error weighted by attempts."""
+    out = {}
+    for stat in M.TARGET_STATS:
+        out[f"{prefix}{stat}_MAE36"] = PER_36 * _weighted_mae(
+            actual[f"{stat}_RATE"], rates[stat], weight
+        )
+    for made, att, name in (("FGM", "FGA", "FG_PCT"), ("FTM", "FTA", "FT_PCT")):
+        attempts = actual[f"{att}_RATE"] * actual["MIN"]
+        usable = attempts > 0
+        actual_pct = actual[f"{made}_RATE"] / actual[f"{att}_RATE"]
+        predicted_pct = rates[made] / rates[att]
+        out[f"{prefix}{name}_MAE"] = _weighted_mae(
+            actual_pct[usable], predicted_pct[usable], attempts[usable]
+        )
+    return out
+
+
+def _value_spearman(actual: pd.DataFrame, rates: pd.DataFrame, mpg, gp) -> float:
+    """Rank predicted 9-cat season value against actual, within the rookie class."""
+    predicted = _nine_cat_value(_totals(rates, np.asarray(mpg), np.asarray(gp)))
+    if predicted.nunique() < 2:
+        return float("nan")
+    return _spearman(predicted, _value_spearman_target(actual))
+
+
+def _second_year_test(
+    year: int,
+    history: pd.DataFrame,
+    draft: pd.DataFrame,
+    pairs: pd.DataFrame,
+    decisions: dict,
+    models: dict,
+    replacement: pd.Series,
+    league_prev: pd.Series,
+) -> dict:
+    """Second-year players with a rookie season under 200 minutes: shrink toward
+    replacement (old) versus toward their rookie prior (new)."""
+    past = history.loc[history["SEASON_YEAR"] < year]
+    first_year = history.groupby("PLAYER_ID")["SEASON_YEAR"].min()
+    rookie_rows = past.loc[past["SEASON_YEAR"] == year - 1].set_index("PLAYER_ID")
+    actual = history.loc[history["SEASON_YEAR"] == year].set_index("PLAYER_ID")
+    candidates = [
+        player_id
+        for player_id in rookie_rows.index
+        if first_year.get(player_id) == year - 1
+        and rookie_rows.loc[player_id, "MIN"] < P.CREDIBILITY_MINUTES
+        and player_id in actual.index
+        and actual.loc[player_id, "MIN"] >= EXPANDED_MINUTES_THRESHOLD
+    ]
+    if len(candidates) < 5:
+        return {"SecondYear_N": len(candidates)}
+    # Only these players' rows: their rate features are per player, so this
+    # matches the full run (league-relative production scores are not used here).
+    latest, latest_year = P.latest_season_rows(past.loc[past["PLAYER_ID"].isin(candidates)])
+    roster = pd.DataFrame({"PLAYER_ID": candidates, "TEAM_ABBREVIATION": "BT", "ROSTER_NAME": pd.NA})
+    table = P.build_inference_table(roster, latest, latest_year, replacement)
+    features = R.prior_features(table["PLAYER_ID"], past, draft, pd.Series(dtype=float))
+    priors = R.predict_rookies(models, features, league_prev)
+    targets = pd.DataFrame(
+        np.tile(replacement.reindex(M.TARGET_STATS).to_numpy(), (len(table), 1)),
+        index=table.index, columns=M.TARGET_STATS,
+    )
+    has = features["HAS_ROOKIE_PRIOR"]
+    targets.loc[has, M.TARGET_STATS] = priors.loc[has, M.TARGET_STATS]
+    bundle = M.build_bundle(M._train_slice(pairs, year), decisions)
+    rates_old, _ = P.predict_with_credibility(bundle, table, replacement)
+    rates_new, _ = P.predict_with_credibility(bundle, table, targets)
+    truth = actual.loc[table["PLAYER_ID"]].reset_index()
+    truth.index = table.index
+    out = {"SecondYear_N": len(candidates)}
+    out.update(_rate_metrics(truth, rates_old, truth["MIN"], "SecondYear_replacement_"))
+    out.update(_rate_metrics(truth, rates_new, truth["MIN"], "SecondYear_draft_"))
+    return out
+
+
+def _score_rookie_class(
+    year: int,
+    history: pd.DataFrame,
+    draft: pd.DataFrame,
+    rookies: pd.DataFrame,
+    pairs: pd.DataFrame,
+    decisions: dict,
+) -> tuple[dict, pd.DataFrame]:
+    print(f"\n=== Rookie backtest: class of {year} from classes before {year} ===")
+    past = history.loc[history["SEASON_YEAR"] < year]
+    train = rookies.loc[rookies["SEASON_YEAR"] < year]
+    test = rookies.loc[rookies["SEASON_YEAR"] == year].copy()
+    models = R.fit_rookie_models(train, M.TARGET_STATS)
+    league_prev = R.league_rates(past, M.TARGET_STATS).iloc[-1]
+    replacement = P.replacement_rates(past, year - 1, {})
+    _, typical_bench_gp = P.league_typical_games(past)
+    actual_min_82 = test["MIN"] * test["GAMES_82"] / test["GP"]  # shortened seasons scaled to 82
+
+    pred = R.predict_rookies(models, test, league_prev)
+    replacement_rates = pd.DataFrame(
+        np.tile(replacement.reindex(M.TARGET_STATS).to_numpy(), (len(test), 1)),
+        index=test.index, columns=M.TARGET_STATS,
+    )
+    # What project.py uses: draft prior for ROOKIE_RATE_STATS, replacement otherwise.
+    deployed_rates = replacement_rates.copy()
+    deployed_rates[P.ROOKIE_RATE_STATS] = pred[P.ROOKIE_RATE_STATS]
+    mean_mpg = float(train["MPG"].mean())
+    mean_games = float(train["GAMES_82"].mean())
+
+    rated = test["MIN"] >= R.RATE_MIN_MINUTES
+    result = {
+        "Class": year,
+        "Rookies": len(test),
+        "Rookies_200_Min": int(rated.sum()),
+        "MPG_MAE_draft": float(np.mean(np.abs(test["MPG"] - pred["MPG"]))),
+        "MPG_MAE_typical_rookie": float(np.mean(np.abs(test["MPG"] - mean_mpg))),
+        "GAMES_MAE_draft": float(np.mean(np.abs(test["GAMES_82"] - pred["GAMES_82"]))),
+        "GAMES_MAE_current": float(np.mean(np.abs(test["GAMES_82"] - typical_bench_gp))),
+        "GAMES_MAE_typical_rookie": float(np.mean(np.abs(test["GAMES_82"] - mean_games))),
+        "SEASON_MIN_MAE_draft": float(np.mean(np.abs(actual_min_82 - pred["MPG"] * pred["GAMES_82"]))),
+        "SEASON_MIN_MAE_typical_rookie": float(np.mean(np.abs(actual_min_82 - mean_mpg * mean_games))),
+        "MPG_Spearman_draft": _spearman(pred["MPG"], test["MPG"]),
+        "GAMES_Spearman_draft": _spearman(pred["GAMES_82"], test["GAMES_82"]),
+        "VALUE_Spearman_draft": _value_spearman(test, deployed_rates, pred["MPG"], pred["GAMES_82"]),
+        "VALUE_Spearman_draft_all_rates": _value_spearman(test, pred, pred["MPG"], pred["GAMES_82"]),
+        "VALUE_Spearman_pick_order": _spearman(-test["LOG_PICK"], _value_spearman_target(test)),
+    }
+    result.update(_rate_metrics(test.loc[rated], pred.loc[rated], test.loc[rated, "MIN"], "draft_"))
+    result.update(
+        _rate_metrics(test.loc[rated], replacement_rates.loc[rated], test.loc[rated, "MIN"], "replacement_")
+    )
+    result.update(
+        _second_year_test(year, history, draft, pairs, decisions, models, replacement, league_prev)
+    )
+
+    players = test[["PLAYER_ID", "PLAYER_NAME", "SEASON_YEAR", "OVERALL_PICK", "AGE", "MIN", "MPG", "GAMES_82"]].copy()
+    players["PRED_MPG"] = pred["MPG"]
+    players["PRED_GAMES_82"] = pred["GAMES_82"]
+    for stat in ("PTS", "REB", "AST", "FG3M", "STL", "BLK"):
+        players[f"{stat}_36"] = PER_36 * test[f"{stat}_RATE"]
+        players[f"PRED_{stat}_36"] = PER_36 * pred[stat]
+    return result, players
+
+
+def _value_spearman_target(test: pd.DataFrame) -> pd.Series:
+    real_rates = pd.DataFrame(
+        {stat: test[f"{stat}_RATE"].to_numpy() for stat in M.TARGET_STATS}, index=test.index
+    )
+    return _nine_cat_value(_totals(real_rates, test["MPG"].to_numpy(), test["GP"].to_numpy()))
+
+
+def _rookie_summary(results: pd.DataFrame) -> dict:
+    """Mean of each metric over classes, and whether the draft prior beat each
+    baseline in every class (the project's adoption test)."""
+    summary = {"classes": [int(y) for y in results["Class"]], "metrics": {}, "beats_every_class": {}}
+    for column in results.columns:
+        if column != "Class":
+            summary["metrics"][column] = round(float(results[column].mean()), 4)
+    comparisons = [("MPG_MAE_draft", "MPG_MAE_typical_rookie"),
+                   ("GAMES_MAE_draft", "GAMES_MAE_current"),
+                   ("GAMES_MAE_draft", "GAMES_MAE_typical_rookie"),
+                   ("SEASON_MIN_MAE_draft", "SEASON_MIN_MAE_typical_rookie")]
+    for stat in M.TARGET_STATS + ["FG_PCT", "FT_PCT"]:
+        suffix = "_MAE" if stat.endswith("_PCT") else "_MAE36"
+        comparisons.append((f"draft_{stat}{suffix}", f"replacement_{stat}{suffix}"))
+        if f"SecondYear_draft_{stat}{suffix}" in results.columns:
+            comparisons.append((f"SecondYear_draft_{stat}{suffix}", f"SecondYear_replacement_{stat}{suffix}"))
+    for new, old in comparisons:
+        both = results[[new, old]].dropna()
+        summary["beats_every_class"][f"{new} < {old}"] = bool(len(both) and (both[new] < both[old]).all())
+    return summary
+
+
+def run_rookies(first_class: int = ROOKIE_FIRST_CLASS) -> None:
+    history = P.load_history()
+    draft = R.load_draft_history()
+    rookies = R.rookie_seasons(history, draft, M.TARGET_STATS)
+    decisions = json.loads(M.MODEL_METADATA_PATH.read_text())["policy_decisions"]
+    pairs = M.load_training_pairs()
+    last_class = int(rookies["SEASON_YEAR"].max())
+    records, player_frames = [], []
+    for year in range(first_class, last_class + 1):
+        result, players = _score_rookie_class(year, history, draft, rookies, pairs, decisions)
+        records.append(result)
+        player_frames.append(players)
+    results = pd.DataFrame(records)
+    results.to_csv(ROOKIE_RESULTS_PATH, index=False)
+    pd.concat(player_frames, ignore_index=True).to_csv(ROOKIE_PLAYERS_PATH, index=False)
+    summary = _rookie_summary(results)
+    ROOKIE_SUMMARY_PATH.write_text(json.dumps(summary, indent=2) + "\n")
+
+    show = ["Class", "Rookies", "MPG_MAE_draft", "MPG_MAE_typical_rookie", "GAMES_MAE_draft",
+            "GAMES_MAE_current", "VALUE_Spearman_draft", "VALUE_Spearman_pick_order"]
+    print("\nRookie classes (draft prior vs baselines):")
+    print(results[show].round(3).to_string(index=False))
+    print("\nPer-36 rate error, rookies with 200+ minutes (draft prior vs replacement):")
+    rate_table = pd.DataFrame(
+        {
+            "draft": [summary["metrics"][f"draft_{s}_MAE36"] for s in M.TARGET_STATS],
+            "replacement": [summary["metrics"][f"replacement_{s}_MAE36"] for s in M.TARGET_STATS],
+            "2nd_yr_draft": [summary["metrics"].get(f"SecondYear_draft_{s}_MAE36") for s in M.TARGET_STATS],
+            "2nd_yr_replacement": [summary["metrics"].get(f"SecondYear_replacement_{s}_MAE36") for s in M.TARGET_STATS],
+        },
+        index=M.TARGET_STATS,
+    )
+    print(rate_table.round(3).to_string())
+    print("\nBeats the baseline in every class:")
+    for key, value in summary["beats_every_class"].items():
+        print(f"  {'yes' if value else 'NO '}  {key}")
+    print(f"\nWrote {ROOKIE_RESULTS_PATH.name}, {ROOKIE_PLAYERS_PATH.name} and {ROOKIE_SUMMARY_PATH.name}")
+
+
 if __name__ == "__main__":
-    run(int(sys.argv[1]) if len(sys.argv) > 1 else None)
+    if len(sys.argv) > 1 and sys.argv[1] == "rookies":
+        run_rookies()
+    else:
+        run(int(sys.argv[1]) if len(sys.argv) > 1 else None)
+        run_rookies()
