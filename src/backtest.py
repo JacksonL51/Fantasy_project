@@ -842,6 +842,10 @@ def _score_rookie_class(
     actual_min_82 = test["MIN"] * test["GAMES_82"] / test["GP"]  # shortened seasons scaled to 82
 
     pred = R.predict_rookies(models, test, league_prev)
+    # Layer 1 alone (draft slot and age, no team opportunity), to show what layer 2 adds.
+    slot_only = R.predict_rookies(
+        R.fit_rookie_models(train, M.TARGET_STATS, use_opportunity=False), test, league_prev
+    )
     replacement_rates = pd.DataFrame(
         np.tile(replacement.reindex(M.TARGET_STATS).to_numpy(), (len(test), 1)),
         index=test.index, columns=M.TARGET_STATS,
@@ -859,6 +863,11 @@ def _score_rookie_class(
         "Rookies_200_Min": int(rated.sum()),
         "MPG_MAE_draft": float(np.mean(np.abs(test["MPG"] - pred["MPG"]))),
         "MPG_MAE_typical_rookie": float(np.mean(np.abs(test["MPG"] - mean_mpg))),
+        "MPG_MAE_slot_only": float(np.mean(np.abs(test["MPG"] - slot_only["MPG"]))),
+        "GAMES_MAE_slot_only": float(np.mean(np.abs(test["GAMES_82"] - slot_only["GAMES_82"]))),
+        "SEASON_MIN_MAE_slot_only": float(
+            np.mean(np.abs(actual_min_82 - slot_only["MPG"] * slot_only["GAMES_82"]))
+        ),
         "GAMES_MAE_draft": float(np.mean(np.abs(test["GAMES_82"] - pred["GAMES_82"]))),
         "GAMES_MAE_current": float(np.mean(np.abs(test["GAMES_82"] - typical_bench_gp))),
         "GAMES_MAE_typical_rookie": float(np.mean(np.abs(test["GAMES_82"] - mean_games))),
@@ -904,7 +913,10 @@ def _rookie_summary(results: pd.DataFrame) -> dict:
     comparisons = [("MPG_MAE_draft", "MPG_MAE_typical_rookie"),
                    ("GAMES_MAE_draft", "GAMES_MAE_current"),
                    ("GAMES_MAE_draft", "GAMES_MAE_typical_rookie"),
-                   ("SEASON_MIN_MAE_draft", "SEASON_MIN_MAE_typical_rookie")]
+                   ("SEASON_MIN_MAE_draft", "SEASON_MIN_MAE_typical_rookie"),
+                   ("MPG_MAE_draft", "MPG_MAE_slot_only"),
+                   ("GAMES_MAE_draft", "GAMES_MAE_slot_only"),
+                   ("SEASON_MIN_MAE_draft", "SEASON_MIN_MAE_slot_only")]
     for stat in M.TARGET_STATS + ["FG_PCT", "FT_PCT"]:
         suffix = "_MAE" if stat.endswith("_PCT") else "_MAE36"
         comparisons.append((f"draft_{stat}{suffix}", f"replacement_{stat}{suffix}"))
@@ -934,8 +946,9 @@ def run_rookies(first_class: int = ROOKIE_FIRST_CLASS) -> None:
     summary = _rookie_summary(results)
     ROOKIE_SUMMARY_PATH.write_text(json.dumps(summary, indent=2) + "\n")
 
-    show = ["Class", "Rookies", "MPG_MAE_draft", "MPG_MAE_typical_rookie", "GAMES_MAE_draft",
-            "GAMES_MAE_current", "VALUE_Spearman_draft", "VALUE_Spearman_pick_order"]
+    show = ["Class", "Rookies", "MPG_MAE_draft", "MPG_MAE_slot_only", "MPG_MAE_typical_rookie",
+            "GAMES_MAE_draft", "GAMES_MAE_slot_only", "GAMES_MAE_current",
+            "VALUE_Spearman_draft", "VALUE_Spearman_pick_order"]
     print("\nRookie classes (draft prior vs baselines):")
     print(results[show].round(3).to_string(index=False))
     print("\nPer-36 rate error, rookies with 200+ minutes (draft prior vs replacement):")

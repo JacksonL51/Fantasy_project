@@ -478,7 +478,24 @@ def rookie_priors(
     models = R.fit_rookie_models(seasons, TARGET_STATS)
     league = R.league_rates(history, TARGET_STATS).iloc[-1]
     features = R.prior_features(table["PLAYER_ID"], history, draft, current_ages)
+    # Team opportunity on the current roster, as in training: teammates' latest-season
+    # MPG (15+ games) and last season's minutes on this team by players now gone.
+    latest_year = int(history["SEASON_YEAR"].max())
+    last = history.loc[history["SEASON_YEAR"] == latest_year]
+    prior_mpg = (last["MIN"] / last["GP"]).where(last["GP"] >= 15).set_axis(last["PLAYER_ID"])
+    opportunity = R.team_opportunity(
+        pd.DataFrame(
+            {
+                "PLAYER_ID": table["PLAYER_ID"],
+                "TEAM": table["TEAM_ABBREVIATION"],
+                "PRIOR_MPG": table["PLAYER_ID"].map(prior_mpg),
+            }
+        ),
+        last.rename(columns={"TEAM_ABBREVIATION": "TEAM"})[["PLAYER_ID", "TEAM", "MIN"]],
+    )
+    features[R.OPPORTUNITY_FEATURES] = opportunity[R.OPPORTUNITY_FEATURES]
     priors = R.predict_rookies(models, features, league)
+    priors[["TEAM_CROWD", "VACATED_SHARE"]] = opportunity[["TOTAL_CROWD", "VACATED_SHARE"]]
     priors["OVERALL_PICK"] = features["OVERALL_PICK"]
     priors["HAS_ROOKIE_PRIOR"] = features["HAS_ROOKIE_PRIOR"]
     # A true rookie has no NBA season at all. "No prior data" in the table also

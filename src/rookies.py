@@ -29,7 +29,7 @@ from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from history import _games_per_82
+from history import _games_per_82, position_crowding
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DRAFT_HISTORY_PATH = PROJECT_ROOT / "data" / "raw" / "draft_history.csv"
@@ -41,6 +41,13 @@ UNDRAFTED_PICK = 61
 # held-out classes 2016-26, games MAE 16.6 -> 16.1; rates and MPG unchanged.
 # An age x pick interaction added nothing.
 FEATURES = ["LOG_PICK", "LOG_PICK_SQ", "AGE", "UNDRAFTED"]
+# Layer 2, team opportunity, for the MPG and games models only (rates unchanged):
+# TOTAL_CROWD = teammates' prior-season MPG (15+ games) / 240, VACATED_SHARE = share
+# of the team's minutes last season played by players no longer on it. Both are taken
+# relative to that season's average team (_REL), because training uses end-of-season
+# rosters (after trades and cuts) while projections use early-season rosters, which
+# look less open across the board. Positional crowding added nothing.
+OPPORTUNITY_FEATURES = ["TOTAL_CROWD_REL", "VACATED_SHARE_REL"]
 RATE_MIN_MINUTES = 200.0
 RIDGE_ALPHA = 1.0
 MPG_BOUNDS = (4.0, 36.0)
@@ -121,7 +128,68 @@ def rookie_seasons(history: pd.DataFrame, draft: pd.DataFrame, stats: list[str])
     league = league_rates(history, stats)
     for stat in stats:
         first[f"{stat}_INDEX"] = first[f"{stat}_RATE"] / first["SEASON_YEAR"].map(league[stat])
+    first = first.merge(
+        season_opportunity(history), on=["PLAYER_ID", "SEASON_YEAR"], how="left", validate="one_to_one"
+    )
     return first.reset_index(drop=True)
+
+
+def team_opportunity(
+    players: pd.DataFrame, last_season: pd.DataFrame
+) -> pd.DataFrame:
+    """TOTAL_CROWD and VACATED_SHARE for each player on `players`' teams.
+
+    `players`: PLAYER_ID, TEAM (the team now) and PRIOR_MPG (last season's MPG,
+    NaN without a 15-game season). `last_season`: PLAYER_ID, TEAM, MIN for the
+    previous season (each player credited to his last team). VACATED_SHARE is the
+    share of a team's last-season minutes played by players not on it now.
+    """
+    crowd = position_crowding(players, pd.Series(dtype=object))["TOTAL_CROWD"]
+    now = players[["PLAYER_ID", "TEAM"]].rename(columns={"TEAM": "TEAM_NOW"})
+    before = last_season.merge(now, on="PLAYER_ID", how="left")
+    before["GONE"] = before["MIN"].where(before["TEAM_NOW"] != before["TEAM"], 0.0)
+    by_team = before.groupby("TEAM")[["GONE", "MIN"]].sum()
+    vacated = by_team["GONE"] / by_team["MIN"]
+    teams = players["TEAM"].unique()
+    # Average team: full roster demand (as seen by a player with no prior season) and
+    # vacated share, averaged over the teams on `players`.
+    demand = players["PRIOR_MPG"].fillna(0.0).groupby(players["TEAM"]).sum() / 240.0
+    out = pd.DataFrame(
+        {"TOTAL_CROWD": crowd, "VACATED_SHARE": players["TEAM"].map(vacated).to_numpy()},
+        index=players.index,
+    )
+    out["TOTAL_CROWD_REL"] = out["TOTAL_CROWD"] - float(demand.reindex(teams).mean())
+    out["VACATED_SHARE_REL"] = out["VACATED_SHARE"] - float(vacated.reindex(teams).mean())
+    return out
+
+
+def season_opportunity(history: pd.DataFrame) -> pd.DataFrame:
+    """Team opportunity for every player-season, on end-of-season teams."""
+    if "TEAM_ABBREVIATION" not in history.columns:
+        return pd.DataFrame(
+            columns=["PLAYER_ID", "SEASON_YEAR", "TOTAL_CROWD", "VACATED_SHARE", *OPPORTUNITY_FEATURES]
+        )
+    h = history[["PLAYER_ID", "SEASON_YEAR", "TEAM_ABBREVIATION", "GP", "MIN"]].copy()
+    h["MPG"] = h["MIN"] / h["GP"]
+    frames = []
+    for year, season in h.groupby("SEASON_YEAR"):
+        last = h.loc[h["SEASON_YEAR"] == year - 1]
+        if last.empty:
+            continue
+        prior = last.loc[last["GP"] >= 15].set_index("PLAYER_ID")["MPG"]
+        players = pd.DataFrame(
+            {
+                "PLAYER_ID": season["PLAYER_ID"].to_numpy(),
+                "TEAM": season["TEAM_ABBREVIATION"].to_numpy(),
+                "PRIOR_MPG": season["PLAYER_ID"].map(prior).to_numpy(),
+            }
+        )
+        opportunity = team_opportunity(
+            players, last.rename(columns={"TEAM_ABBREVIATION": "TEAM"})[["PLAYER_ID", "TEAM", "MIN"]]
+        )
+        opportunity["PLAYER_ID"], opportunity["SEASON_YEAR"] = players["PLAYER_ID"].to_numpy(), year
+        frames.append(opportunity)
+    return pd.concat(frames, ignore_index=True)
 
 
 # --------------------------------------------------------------------------
@@ -131,8 +199,12 @@ def _ridge() -> Pipeline:
     return Pipeline([("scaler", StandardScaler()), ("ridge", Ridge(alpha=RIDGE_ALPHA))])
 
 
-def fit_rookie_models(rookies: pd.DataFrame, stats: list[str]) -> dict:
-    """Fit rate-index, MPG and games models on the rookie seasons given."""
+def fit_rookie_models(rookies: pd.DataFrame, stats: list[str], use_opportunity: bool = True) -> dict:
+    """Fit rate-index, MPG and games models on the rookie seasons given.
+
+    With `use_opportunity`, the MPG and games models add OPPORTUNITY_FEATURES
+    (rookies without them get the training mean).
+    """
     if len(rookies) < 50:
         raise ValueError(f"Only {len(rookies)} rookie seasons; too few to fit rookie models.")
     rate_rows = rookies.loc[rookies["MIN"] >= RATE_MIN_MINUTES]
@@ -143,8 +215,19 @@ def fit_rookie_models(rookies: pd.DataFrame, stats: list[str]) -> dict:
         model = _ridge()
         model.fit(rate_rows[FEATURES], rate_rows[f"{stat}_INDEX"], ridge__sample_weight=weight)
         rate_models[stat] = model
-    mpg_model = _ridge().fit(rookies[FEATURES], rookies["MPG"])
-    games_model = _ridge().fit(rookies[FEATURES], rookies["GAMES_82"])
+    # Without team data (no TEAM_ABBREVIATION in the history) there is nothing to learn from.
+    use_opportunity = use_opportunity and all(
+        name in rookies and rookies[name].notna().sum() >= 50 for name in OPPORTUNITY_FEATURES
+    )
+    minutes_features = FEATURES + (OPPORTUNITY_FEATURES if use_opportunity else [])
+    opportunity_means = {
+        name: float(rookies[name].mean()) for name in OPPORTUNITY_FEATURES if name in rookies
+    }
+    minutes_rows = rookies.copy()
+    if use_opportunity:
+        minutes_rows[OPPORTUNITY_FEATURES] = minutes_rows[OPPORTUNITY_FEATURES].fillna(opportunity_means)
+    mpg_model = _ridge().fit(minutes_rows[minutes_features], minutes_rows["MPG"])
+    games_model = _ridge().fit(minutes_rows[minutes_features], minutes_rows["GAMES_82"])
 
     drafted = rookies.loc[rookies["UNDRAFTED"] == 0]
     buckets = pd.cut(drafted["OVERALL_PICK"], AGE_FALLBACK_BUCKETS)
@@ -153,6 +236,8 @@ def fit_rookie_models(rookies: pd.DataFrame, stats: list[str]) -> dict:
         "rates": rate_models,
         "mpg": mpg_model,
         "games": games_model,
+        "minutes_features": minutes_features,
+        "opportunity_means": opportunity_means,
         "stats": list(stats),
         "rate_rows": int(len(rate_rows)),
         "rows": int(len(rookies)),
@@ -177,17 +262,23 @@ def fill_missing_age(models: dict, features: pd.DataFrame) -> pd.Series:
 def predict_rookies(models: dict, features: pd.DataFrame, league_rate: pd.Series) -> pd.DataFrame:
     """Rookie prior: per-minute rates (one column per stat), MPG and GAMES_82.
 
-    `features` needs OVERALL_PICK, UNDRAFTED, LOG_PICK and AGE; `league_rate` is
+    `features` needs OVERALL_PICK, UNDRAFTED, LOG_PICK, LOG_PICK_SQ and AGE, and
+    optionally OPPORTUNITY_FEATURES (missing -> training mean); `league_rate` is
     the latest completed season's league rate per stat (no future seasons).
     """
-    X = features[FEATURES].copy()
+    X = features.copy()
     X["AGE"] = fill_missing_age(models, features)
+    for name in OPPORTUNITY_FEATURES:
+        if name in models["minutes_features"]:
+            column = X[name] if name in X else pd.Series(np.nan, index=X.index)
+            X[name] = column.fillna(models["opportunity_means"][name])
     out = pd.DataFrame(index=features.index)
     for stat in models["stats"]:
-        index = np.clip(models["rates"][stat].predict(X), 0.0, None)
+        index = np.clip(models["rates"][stat].predict(X[FEATURES]), 0.0, None)
         out[stat] = index * float(league_rate[stat])
-    out["MPG"] = np.clip(models["mpg"].predict(X), *MPG_BOUNDS)
-    out["GAMES_82"] = np.clip(models["games"].predict(X), *GAMES_BOUNDS)
+    minutes_X = X[models["minutes_features"]]
+    out["MPG"] = np.clip(models["mpg"].predict(minutes_X), *MPG_BOUNDS)
+    out["GAMES_82"] = np.clip(models["games"].predict(minutes_X), *GAMES_BOUNDS)
     return out
 
 

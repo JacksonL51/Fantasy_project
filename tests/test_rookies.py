@@ -125,6 +125,55 @@ class RookieModelTests(unittest.TestCase):
         self.assertEqual(features["NBA_HISTORY"].tolist(), [True, False, True])
 
 
+class TeamOpportunityTests(unittest.TestCase):
+    def test_crowding_and_vacated_share(self):
+        players = pd.DataFrame(
+            {
+                "PLAYER_ID": [1, 2, 3, 4],
+                "TEAM": ["A", "A", "B", "B"],
+                "PRIOR_MPG": [30.0, np.nan, 20.0, np.nan],  # 2 and 4 are rookies
+            }
+        )
+        last_season = pd.DataFrame(
+            {
+                "PLAYER_ID": [1, 5, 3, 6],
+                "TEAM": ["A", "A", "B", "B"],
+                "MIN": [2000.0, 2000.0, 1000.0, 3000.0],  # 5 and 6 have left
+            }
+        )
+        out = R.team_opportunity(players, last_season)
+        self.assertAlmostEqual(out.loc[1, "TOTAL_CROWD"], 30 / 240)
+        self.assertAlmostEqual(out.loc[3, "TOTAL_CROWD"], 20 / 240)
+        self.assertAlmostEqual(out.loc[1, "VACATED_SHARE"], 0.5)
+        self.assertAlmostEqual(out.loc[3, "VACATED_SHARE"], 0.75)
+        # Relative to the average team: A is more crowded, B more open.
+        self.assertAlmostEqual(out.loc[1, "TOTAL_CROWD_REL"], 30 / 240 - 25 / 240)
+        self.assertAlmostEqual(out.loc[3, "VACATED_SHARE_REL"], 0.75 - 0.625)
+
+    def test_open_team_projects_more_minutes(self):
+        history, draft = fake_history()
+        rookies = R.rookie_seasons(history, draft, STATS)
+        rng = np.random.default_rng(1)
+        rookies["TOTAL_CROWD_REL"] = rng.normal(0, 0.2, len(rookies))
+        rookies["VACATED_SHARE_REL"] = rng.normal(0, 0.2, len(rookies))
+        rookies["MPG"] = rookies["MPG"] - 10 * rookies["TOTAL_CROWD_REL"]
+        models = R.fit_rookie_models(rookies, STATS)
+        self.assertIn("TOTAL_CROWD_REL", models["minutes_features"])
+        league = R.league_rates(history, STATS).iloc[-1]
+        same = rookies.iloc[[0, 0]].reset_index(drop=True)
+        same["TOTAL_CROWD_REL"] = [-0.3, 0.3]
+        pred = R.predict_rookies(models, same, league)
+        self.assertGreater(pred.loc[0, "MPG"], pred.loc[1, "MPG"])
+        # Missing opportunity falls back to the training mean instead of failing.
+        bare = same.drop(columns=R.OPPORTUNITY_FEATURES)
+        self.assertFalse(R.predict_rookies(models, bare, league)["MPG"].isna().any())
+
+    def test_no_team_data_skips_opportunity(self):
+        history, draft = fake_history()
+        models = R.fit_rookie_models(R.rookie_seasons(history, draft, STATS), STATS)
+        self.assertEqual(models["minutes_features"], R.FEATURES)
+
+
 class ProjectionHookTests(unittest.TestCase):
     def table(self) -> pd.DataFrame:
         return pd.DataFrame(
