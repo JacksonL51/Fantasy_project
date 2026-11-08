@@ -527,3 +527,158 @@ def predict_games(model: dict, frame: pd.DataFrame) -> pd.Series:
         _predict_games_ridge(model["general"], frame),
     )
     return pd.Series(np.clip(predicted, *GAMES_BOUNDS), index=frame.index)
+
+
+# --------------------------------------------------------------------------
+# Positional crowding (soft MPG adjustment)
+# --------------------------------------------------------------------------
+# Positions are the NBA's coarse career labels from data/raw/player_positions.csv.
+# Each label is split across guard / forward / center slots; a team's floor time
+# per game is 96 guard, 96 forward and 48 center minutes.
+POSITIONS_PATH_PARTS = ("data", "raw", "player_positions.csv")
+POSITION_MEMBERSHIP = {
+    "G": (1.0, 0.0, 0.0),
+    "G-F": (2 / 3, 1 / 3, 0.0),
+    "F-G": (1 / 3, 2 / 3, 0.0),
+    "F": (0.0, 1.0, 0.0),
+    "F-C": (0.0, 2 / 3, 1 / 3),
+    "C-F": (0.0, 1 / 3, 2 / 3),
+    "C": (0.0, 0.0, 1.0),
+}
+POSITION_CAPACITY = np.array([96.0, 96.0, 48.0])
+POSITION_PRIOR_MIN_GP = 15  # a season counts toward teammates' demand with this many games
+POSITION_TARGET_MIN_GP = 20  # next season needs this many games to enter the fit
+POSITION_FIT_YEARS = 14  # fit on the latest target seasons only (2013-26 today): the
+#                          effect is about a third as strong in older seasons
+POSITION_MIN_PAIRS = 300
+POSITION_SHRINK = 1.0  # fraction of the fitted change that is applied
+POSITION_CLIP = 1.5  # max +/- MPG adjustment
+
+
+def load_positions(path=None) -> pd.Series:
+    """POSITION keyed by PLAYER_ID (empty if the file is missing)."""
+    from pathlib import Path
+
+    path = Path(path) if path else Path(__file__).resolve().parents[1].joinpath(*POSITIONS_PATH_PARTS)
+    if not path.exists():
+        return pd.Series(dtype=object)
+    frame = pd.read_csv(path, usecols=["PLAYER_ID", "POSITION"])
+    return frame.dropna().drop_duplicates("PLAYER_ID").set_index("PLAYER_ID")["POSITION"]
+
+
+def position_crowding(players: pd.DataFrame, positions: pd.Series) -> pd.DataFrame:
+    """Team and positional crowding for each player.
+
+    `players` needs PLAYER_ID, TEAM and PRIOR_MPG (last season's MPG, NaN if the
+    player did not have a 15-game season; such players add no demand). Returns
+    TOTAL_CROWD (teammates' prior MPG / 240) and POSITION_CROWD (positional crowding
+    minus TOTAL_CROWD: how much more crowded the player's own position is than the
+    team overall). POSITION_CROWD is NaN without a known position.
+    """
+    labels = players["PLAYER_ID"].map(positions)
+    known = labels.isin(POSITION_MEMBERSHIP)
+    membership = np.array(
+        [POSITION_MEMBERSHIP.get(label, (np.nan, np.nan, np.nan)) for label in labels]
+    )
+    prior = players["PRIOR_MPG"].to_numpy(dtype=float)
+    demand_weight = np.where(np.isfinite(prior), prior, 0.0)
+    # Players without a position still use team minutes; count them only in the total.
+    own = np.nan_to_num(membership) * demand_weight[:, None]
+    frame = pd.DataFrame(own, columns=["G", "F", "C"], index=players.index)
+    frame["ALL"] = demand_weight
+    team_sums = frame.groupby(players["TEAM"].to_numpy()).transform("sum")
+    others = team_sums - frame
+    positional = (membership * others[["G", "F", "C"]].to_numpy() / POSITION_CAPACITY).sum(axis=1)
+    total = others["ALL"].to_numpy() / 240.0
+    return pd.DataFrame(
+        {
+            "TOTAL_CROWD": total,
+            "POSITION_CROWD": np.where(known, positional - total, np.nan),
+        },
+        index=players.index,
+    )
+
+
+def _crowding_pairs(history: pd.DataFrame, positions: pd.Series) -> pd.DataFrame:
+    """t -> t+1 pairs with crowding on the t+1 (end-of-season) team."""
+    h = history[["PLAYER_ID", "SEASON_YEAR", "TEAM_ABBREVIATION", "AGE", "GP", "MIN"]].copy()
+    h["MPG"] = h["MIN"] / h["GP"]
+    prior = h.loc[h["GP"] >= POSITION_PRIOR_MIN_GP, ["PLAYER_ID", "SEASON_YEAR", "MPG"]].copy()
+    prior["SEASON_YEAR"] += 1
+    season = h.merge(
+        prior.rename(columns={"MPG": "PRIOR_MPG"}), on=["PLAYER_ID", "SEASON_YEAR"], how="left"
+    )
+    season = season.loc[season["SEASON_YEAR"] > season["SEASON_YEAR"].min()]
+    season["TEAM"] = season["SEASON_YEAR"].astype(str) + "_" + season["TEAM_ABBREVIATION"].astype(str)
+    season = season.join(position_crowding(season, positions))
+    return season.loc[
+        season["PRIOR_MPG"].notna()
+        & (season["GP"] >= POSITION_TARGET_MIN_GP)
+        & season["POSITION_CROWD"].notna()
+        & season["AGE"].notna()
+    ]
+
+
+def _crowding_design(frame: pd.DataFrame) -> np.ndarray:
+    a = frame["AGE"].to_numpy(dtype=float) - 26.0
+    return np.column_stack(
+        [
+            np.ones(len(frame)),
+            frame["PRIOR_MPG"].to_numpy(dtype=float) - 20.0,
+            a,
+            a**2,
+            frame["TOTAL_CROWD"].to_numpy(dtype=float),
+            frame["POSITION_CROWD"].to_numpy(dtype=float),
+        ]
+    )
+
+
+def fit_position_crowding(history: pd.DataFrame, positions: pd.Series | None = None) -> dict:
+    """Least squares of next-season MPG change on prior MPG, age, team crowding and
+    positional crowding, using end-of-season teams. Only the positional term is
+    applied (the team minutes budget already handles overall crowding). Pass a
+    history that ends at the last season you may use.
+    """
+    positions = load_positions() if positions is None else positions
+    inactive = {"kind": "position", "coef": 0.0, "pairs": 0, "active": False}
+    if positions.empty or "TEAM_ABBREVIATION" not in history.columns:
+        return inactive
+    pairs = _crowding_pairs(history, positions)
+    last_year = int(history["SEASON_YEAR"].max())
+    pairs = pairs.loc[pairs["SEASON_YEAR"] > last_year - POSITION_FIT_YEARS]
+    if len(pairs) < POSITION_MIN_PAIRS:
+        return {**inactive, "pairs": int(len(pairs))}
+    delta = (pairs["MPG"] - pairs["PRIOR_MPG"]).to_numpy(dtype=float)
+    coef, *_ = np.linalg.lstsq(_crowding_design(pairs), delta, rcond=None)
+    return {
+        "kind": "position",
+        "coef": round(float(coef[-1]), 5),
+        "team_coef": round(float(coef[-2]), 5),
+        "team_mean": round(float(pairs["TOTAL_CROWD"].mean()), 5),
+        "pairs": int(len(pairs)),
+        "active": True,
+    }
+
+
+def position_mpg_adjustment(model: dict, crowd: pd.Series) -> pd.Series:
+    """Shrunk, clipped MPG change from positional crowding (0 if inactive or unknown)."""
+    if not model.get("active", False):
+        return pd.Series(0.0, index=crowd.index)
+    change = POSITION_SHRINK * model["coef"] * pd.to_numeric(crowd, errors="coerce")
+    return change.clip(-POSITION_CLIP, POSITION_CLIP).fillna(0.0)
+
+
+TEAM_CROWD_CLIP = 3.0  # max +/- MPG from team crowding
+
+
+def team_mpg_adjustment(model: dict, total: pd.Series, shrink: float) -> pd.Series:
+    """MPG change from overall team crowding, centered on the fit's average crowding.
+
+    The team minutes budget already moves bench minutes with crowding, so this is
+    an optional extra (project.py TEAM_CROWD_ADJUSTMENT) and is shrunk.
+    """
+    if not model.get("active", False) or "team_mean" not in model:
+        return pd.Series(0.0, index=total.index)
+    centered = pd.to_numeric(total, errors="coerce") - model["team_mean"]
+    change = shrink * model["team_coef"] * centered
+    return change.clip(-TEAM_CROWD_CLIP, TEAM_CROWD_CLIP).fillna(0.0)

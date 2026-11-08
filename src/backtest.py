@@ -21,7 +21,15 @@ from scipy.stats import spearmanr
 import model as M
 import project as P
 import rookies as R
-from history import fit_age_mpg_curve, fit_games_model, fit_role_curve
+from history import (
+    fit_age_mpg_curve,
+    fit_games_model,
+    fit_position_crowding,
+    fit_role_curve,
+    load_positions,
+    position_crowding,
+    position_mpg_adjustment,
+)
 
 MIN_ACTUAL_MINUTES = 500.0
 EXPANDED_MINUTES_THRESHOLD = 200.0
@@ -132,6 +140,35 @@ def _minutes_test(
     return records
 
 
+def _position_mpg(
+    year: int, history: pd.DataFrame, table: pd.DataFrame, mpg: pd.Series
+) -> tuple[pd.Series, dict]:
+    """Age-adjusted MPG plus the positional crowding change.
+
+    Teams are the target season's end-of-season teams (no historical opening-day
+    rosters exist), with demand from every player on that team who had a 15-game
+    season the year before, the same as the fit. The fit itself uses seasons
+    before `year` only. Slightly optimistic: those rosters are known in hindsight.
+    """
+    past = history.loc[history["SEASON_YEAR"] < year]
+    model = fit_position_crowding(past)
+    season = history.loc[history["SEASON_YEAR"] == year, ["PLAYER_ID", "TEAM_ABBREVIATION"]]
+    before = past.loc[(past["SEASON_YEAR"] == year - 1) & (past["GP"] >= 15)]
+    prior = (before["MIN"] / before["GP"]).set_axis(before["PLAYER_ID"])
+    frame = pd.DataFrame(
+        {
+            "PLAYER_ID": season["PLAYER_ID"].to_numpy(),
+            "TEAM": season["TEAM_ABBREVIATION"].to_numpy(),
+            "PRIOR_MPG": season["PLAYER_ID"].map(prior).to_numpy(),
+        }
+    )
+    crowd = position_crowding(frame, load_positions()).set_axis(frame["PLAYER_ID"])
+    player_crowd = table["PLAYER_ID"].map(crowd["POSITION_CROWD"])
+    has_prior = table["PLAYER_ID"].map(prior).notna()
+    shift = position_mpg_adjustment(model, player_crowd).where(has_prior, 0.0)
+    return (mpg + shift).clip(P.MIN_HEALTHY_MPG, P.MAX_HEALTHY_MPG), model
+
+
 def _score_year(
     year: int,
     history: pd.DataFrame,
@@ -209,6 +246,11 @@ def _score_year(
     variants["fitted_games"] = _totals(rates, mpg.to_numpy(), fitted_gp.to_numpy())
     variants["fitted_games_role"] = _totals(
         rates, mpg_role.to_numpy(), fitted_gp.to_numpy()
+    )
+    mpg_position, position_model = _position_mpg(year, history, table, mpg)
+    print(f"Positional crowding: {position_model}")
+    variants["fitted_games_position"] = _totals(
+        rates, mpg_position.to_numpy(), fitted_gp.to_numpy()
     )
     variants["pipeline_no_age"] = _totals(
         rates, mpg_flat.to_numpy(), no_age_gp.to_numpy()
@@ -321,12 +363,14 @@ def _score_year(
             "none": mpg_flat.to_numpy(),
             "age": mpg.to_numpy(),
             "role": mpg_role.to_numpy(),
+            "age_position": mpg_position.to_numpy(),
             "last_season": last_mpg,
         },
     )
     players["BASELINE_MPG"] = table["BASELINE_ACTIVE_MPG"].to_numpy()
     players["PRED_MPG_AGE"] = mpg.to_numpy()
     players["PRED_MPG_ROLE"] = mpg_role.to_numpy()
+    players["PRED_MPG_POSITION"] = mpg_position.to_numpy()
     players["PROD_Z"] = table["PROD_Z"].to_numpy()
     return pd.DataFrame(records), players, minutes_records
 
@@ -551,6 +595,34 @@ def _recommend(
         minutes_choice = "none"
     else:
         minutes_choice = "age"
+    # Positional crowding: "fitted" only if, in at least two seasons, it lowers
+    # MPG error for all players and keeps value rank (500+ minutes) within tolerance.
+    position_rows = []
+    for year in years:
+        yearly = minutes.loc[(minutes["Target_Year"] == year) & (minutes["Group"] == "all")]
+        by_method = yearly.set_index("Method")
+        if not {"age", "age_position"}.issubset(by_method.index):
+            continue
+        value_age = pick(year, "500+ actual minutes", "fitted_games")["VALUE_Spearman"]
+        value_position = pick(year, "500+ actual minutes", "fitted_games_position")["VALUE_Spearman"]
+        mae_age = float(by_method.loc["age", "MPG_MAE"])
+        mae_position = float(by_method.loc["age_position", "MPG_MAE"])
+        position_rows.append(
+            {
+                "Target_Year": year,
+                "MPG_MAE_age": mae_age,
+                "MPG_MAE_age_position": mae_position,
+                "VALUE_Spearman_age": float(value_age),
+                "VALUE_Spearman_age_position": float(value_position),
+                "passes": bool(
+                    mae_position < mae_age and value_position >= value_age - VALUE_TOLERANCE
+                ),
+            }
+        )
+    position_wins = sum(row["passes"] for row in position_rows)
+    position_choice = "fitted" if len(years) >= 2 and position_wins >= 2 else "none"
+    if len(years) < 2:
+        position_choice = P.POSITION_ADJUSTMENT
     note = (
         "" if len(years) >= 2
         else "Only one season was run; recommendations need at least two "
@@ -559,7 +631,9 @@ def _recommend(
     return {
         "GAMES_METHOD": games_choice,
         "MPG_ADJUSTMENT": minutes_choice,
+        "POSITION_ADJUSTMENT": position_choice,
         "note": note,
+        "position_evidence": position_rows,
         "games_evidence": games_rows,
         "games_mean_rank_gain": mean_rank_gain,
         "role_evidence": role_rows,
@@ -623,7 +697,7 @@ def run(year: int | None = None) -> None:
     minutes_table = pd.DataFrame(minutes_records)
     minutes_table.to_csv(MINUTES_TEST_PATH, index=False)
     compare = [
-        "default_blend", "fitted_games", "role_mpg", "fitted_games_role",
+        "default_blend", "fitted_games", "role_mpg", "fitted_games_role", "fitted_games_position",
         "pipeline_no_age", "naive",
     ]
     shown = all_results.loc[all_results["Variant"].isin(compare)]
@@ -649,6 +723,7 @@ def run(year: int | None = None) -> None:
     print("\nRecommended settings for project.py:")
     print(f'  GAMES_METHOD = "{recommendations["GAMES_METHOD"]}"')
     print(f'  MPG_ADJUSTMENT = "{recommendations["MPG_ADJUSTMENT"]}"')
+    print(f'  POSITION_ADJUSTMENT = "{recommendations["POSITION_ADJUSTMENT"]}"')
     if recommendations["note"]:
         print("  " + recommendations["note"])
     print(
@@ -880,9 +955,200 @@ def run_rookies(first_class: int = ROOKIE_FIRST_CLASS) -> None:
     print(f"\nWrote {ROOKIE_RESULTS_PATH.name}, {ROOKIE_PLAYERS_PATH.name} and {ROOKIE_SUMMARY_PATH.name}")
 
 
+# --------------------------------------------------------------------------
+# Allocation backtest: the full projection, team minutes budget included, on
+# rosters rebuilt from each target season's end-of-season teams
+# --------------------------------------------------------------------------
+ALLOCATION_RESULTS_PATH = M.PROCESSED_DIR / "allocation_backtest_results.csv"
+ALLOCATION_PLAYERS_PATH = M.PROCESSED_DIR / "allocation_backtest_players.csv"
+TEAM_CROWD_SHRINK_GRID = (0.5, 1.0)
+ALLOCATION_VARIANTS = {
+    "current": {"rookie_method": "draft", "position_method": "fitted", "team_crowd_method": "none"},
+    "no_position": {"rookie_method": "draft", "position_method": "none", "team_crowd_method": "none"},
+    "rookie_replacement": {"rookie_method": "replacement", "position_method": "fitted", "team_crowd_method": "none"},
+    **{
+        f"budget_{method}": {
+            "rookie_method": "draft", "position_method": "fitted",
+            "team_crowd_method": "none", "allocation_method": method,
+        }
+        for method in ("raw_priority", "proportional", "soft", "none")
+    },
+    **{
+        f"team_crowd_{shrink:g}": {
+            "rookie_method": "draft", "position_method": "fitted",
+            "team_crowd_method": "fitted", "team_crowd_shrink": shrink,
+        }
+        for shrink in TEAM_CROWD_SHRINK_GRID
+    },
+}
+
+
+def _season_totals(frame: pd.DataFrame, source: str) -> pd.DataFrame:
+    """T_[stat] columns for _nine_cat_value, from projected totals or actual rates x minutes."""
+    if source == "projected":
+        return pd.DataFrame(
+            {f"T_{s}": frame[f"TOTAL_{s}"].to_numpy() for s in M.TARGET_STATS}, index=frame.index
+        )
+    return pd.DataFrame(
+        {f"T_{s}": (frame[f"{s}_RATE"] * frame["MIN"]).to_numpy() for s in M.TARGET_STATS},
+        index=frame.index,
+    )
+
+
+def _allocation_metrics(
+    pred: pd.DataFrame, actual: pd.DataFrame, mask: pd.Series, mpg_column: str, minutes_column: str
+) -> dict:
+    p, a = pred.loc[mask], actual.loc[mask]
+    if len(p) < 10:
+        return {}
+    act_mpg = a["MIN"] / a["GP"]
+    out = {
+        "Players": int(len(p)),
+        "MPG_MAE": float(np.mean(np.abs(p[mpg_column] - act_mpg))),
+        "MPG_Bias": float(np.mean(p[mpg_column] - act_mpg)),
+        "SEASON_MIN_MAE": float(np.mean(np.abs(p[minutes_column] - a["MIN"]))),
+        "SEASON_MIN_Spearman": _spearman(p[minutes_column], a["MIN"]),
+    }
+    projected = _season_totals(p, "projected")
+    if minutes_column != "PROJECTED_SEASON_MIN":
+        # Same rates, different season minutes.
+        projected = projected.mul(p[minutes_column] / p["PROJECTED_SEASON_MIN"], axis=0)
+    out["VALUE_Spearman"] = _spearman(
+        _nine_cat_value(projected), _nine_cat_value(_season_totals(a, "actual"))
+    )
+    return out
+
+
+def _score_allocation_year(
+    year: int, history: pd.DataFrame, pairs: pd.DataFrame, decisions: dict, draft: pd.DataFrame
+) -> tuple[list[dict], pd.DataFrame]:
+    print(f"\n=== Allocation backtest: {year} on end-of-season rosters, data through {year - 1} ===")
+    past = history.loc[history["SEASON_YEAR"] < year]
+    season = history.loc[history["SEASON_YEAR"] == year].set_index("PLAYER_ID")
+    roster = pd.DataFrame(
+        {
+            "PLAYER_ID": season.index.to_numpy(),
+            "TEAM_ABBREVIATION": season["TEAM_ABBREVIATION"].to_numpy(),
+            "ROSTER_NAME": season["PLAYER_NAME"].to_numpy(),
+        }
+    )
+    newcomers = ~season.index.isin(past["PLAYER_ID"])
+    # Rookie-season age, as rookie_ages.csv gives for current rookies.
+    current_ages = season.loc[newcomers, "AGE"]
+    bundle = M.build_bundle(M._train_slice(pairs, year), decisions)
+    latest = P.latest_season_rows(past)
+
+    records, frames = [], []
+    for name, options in ALLOCATION_VARIANTS.items():
+        try:
+            pred = P.project_rosters(
+                bundle, roster, past, latest=latest, draft=draft, current_ages=current_ages, **options
+            )
+        except ValueError as error:
+            print(f"{name}: allocation failed ({error})")
+            records.append({"Target_Year": year, "Variant": name, "Group": "all", "Failed": str(error)})
+            continue
+        pred = pred.set_index("PLAYER_ID")
+        actual = season.loc[pred.index]
+        act_mpg = actual["MIN"] / actual["GP"]
+        groups = {
+            "200+ actual minutes": actual["MIN"] >= EXPANDED_MINUTES_THRESHOLD,
+            "500+ actual minutes": actual["MIN"] >= MIN_ACTUAL_MINUTES,
+            "starters_24_plus_actual": (act_mpg >= 24) & (actual["GP"] >= 20),
+            "rookies": pd.Series(~pred.index.isin(past["PLAYER_ID"]), index=pred.index),
+        }
+        scored = [(name, "PROJECTED_MPG", "PROJECTED_SEASON_MIN")]
+        for label, mpg_column, minutes_column in scored:
+            for group, mask in groups.items():
+                metrics = _allocation_metrics(pred, actual, mask, mpg_column, minutes_column)
+                if metrics:
+                    records.append({"Target_Year": year, "Variant": label, "Group": group, **metrics})
+        frame = pred[
+            ["PLAYER_NAME", "TEAM_ABBREVIATION", "RAW_MPG", "PROJECTED_MPG", "PROJECTED_GP", "PROJECTED_SEASON_MIN"]
+        ].copy()
+        frame["Variant"], frame["Target_Year"] = name, year
+        frame["ACTUAL_MPG"], frame["ACTUAL_GP"], frame["ACTUAL_MIN"] = act_mpg, actual["GP"], actual["MIN"]
+        frames.append(frame.reset_index())
+    return records, pd.concat(frames, ignore_index=True)
+
+
+def _recommend_team_crowd(results: pd.DataFrame, years: list[int]) -> dict:
+    """Team crowding is recommended ("fitted", best shrink) only if, in at least two
+    seasons, it lowers 500+ minute season-minutes error versus the current setup and
+    keeps value rank within tolerance."""
+    rows = results.loc[results["Group"] == "500+ actual minutes"].set_index(["Target_Year", "Variant"])
+    best = {"TEAM_CROWD_ADJUSTMENT": "none", "TEAM_CROWD_SHRINK": P.TEAM_CROWD_SHRINK, "team_crowd_evidence": []}
+    best_key = None
+    for shrink in TEAM_CROWD_SHRINK_GRID:
+        name = f"team_crowd_{shrink:g}"
+        wins, gain = 0, 0.0
+        for year in years:
+            if (year, name) not in rows.index or (year, "current") not in rows.index:
+                continue
+            new, old = rows.loc[(year, name)], rows.loc[(year, "current")]
+            passes = bool(
+                new["SEASON_MIN_MAE"] < old["SEASON_MIN_MAE"]
+                and new["VALUE_Spearman"] >= old["VALUE_Spearman"] - VALUE_TOLERANCE
+            )
+            wins += passes
+            gain += float(old["SEASON_MIN_MAE"] - new["SEASON_MIN_MAE"])
+            best["team_crowd_evidence"].append(
+                {
+                    "Target_Year": year, "Shrink": shrink, "passes": passes,
+                    "SEASON_MIN_MAE_current": float(old["SEASON_MIN_MAE"]),
+                    "SEASON_MIN_MAE_team_crowd": float(new["SEASON_MIN_MAE"]),
+                    "VALUE_Spearman_current": float(old["VALUE_Spearman"]),
+                    "VALUE_Spearman_team_crowd": float(new["VALUE_Spearman"]),
+                }
+            )
+        if len(years) >= 2 and wins >= 2 and (best_key is None or (wins, gain) > best_key):
+            best_key = (wins, gain)
+            best["TEAM_CROWD_ADJUSTMENT"], best["TEAM_CROWD_SHRINK"] = "fitted", shrink
+    return best
+
+
+def run_allocation(years: list[int] | None = None) -> None:
+    history = P.load_history()
+    last_year = int(history["SEASON_YEAR"].max())
+    years = years or list(range(last_year - 2, last_year + 1))
+    decisions = json.loads(M.MODEL_METADATA_PATH.read_text())["policy_decisions"]
+    pairs = M.load_training_pairs()
+    draft = R.load_draft_history()
+    records, frames = [], []
+    for year in years:
+        year_records, players = _score_allocation_year(year, history, pairs, decisions, draft)
+        records.extend(year_records)
+        frames.append(players)
+    results = pd.DataFrame(records)
+    results.to_csv(ALLOCATION_RESULTS_PATH, index=False)
+    pd.concat(frames, ignore_index=True).to_csv(ALLOCATION_PLAYERS_PATH, index=False)
+
+    shown = results.loc[results["Group"].isin(["500+ actual minutes", "starters_24_plus_actual", "rookies"])]
+    columns = [
+        c for c in ["MPG_MAE", "MPG_Bias", "SEASON_MIN_MAE", "SEASON_MIN_Spearman", "VALUE_Spearman"]
+        if c in shown.columns
+    ]
+    for (year, group), table in shown.groupby(["Target_Year", "Group"], sort=True):
+        print(f"\n{year} / {group}")
+        print(table.set_index("Variant")[columns].round(3).to_string())
+    recommendation = _recommend_team_crowd(results, years)
+    if RECOMMENDATIONS_PATH.exists():
+        merged = json.loads(RECOMMENDATIONS_PATH.read_text())
+        merged.update(recommendation)
+        RECOMMENDATIONS_PATH.write_text(json.dumps(merged, indent=2) + "\n")
+    print(
+        f'\nRecommended: TEAM_CROWD_ADJUSTMENT = "{recommendation["TEAM_CROWD_ADJUSTMENT"]}"'
+        f' (shrink {recommendation["TEAM_CROWD_SHRINK"]})'
+    )
+    print(f"Wrote {ALLOCATION_RESULTS_PATH.name} and {ALLOCATION_PLAYERS_PATH.name}")
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "rookies":
         run_rookies()
+    elif len(sys.argv) > 1 and sys.argv[1] == "allocation":
+        run_allocation()
     else:
         run(int(sys.argv[1]) if len(sys.argv) > 1 else None)
         run_rookies()
+        run_allocation()
