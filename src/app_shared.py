@@ -118,7 +118,10 @@ def plain_text(text: str) -> str:
 
 def data_note(row: pd.Series) -> str:
     if row["NO_PRIOR_DATA"]:
-        return "No NBA history"
+        if row.get("ROOKIE_PRIOR", False) == True:  # noqa: E712 (numpy bools)
+            pick = row.get("DRAFT_PICK")
+            return f"Rookie, pick {int(pick)}" if pd.notna(pick) else "Rookie, undrafted"
+        return "No recent NBA seasons"
     if row["STALE_DATA"]:
         return "Missed last season"
     return ""
@@ -145,6 +148,48 @@ def require_players() -> tuple[pd.DataFrame, datetime]:
         st.stop()
     modified = PROJECTIONS_PATH.stat().st_mtime
     return load_players(str(PROJECTIONS_PATH), modified), datetime.fromtimestamp(modified)
+
+
+DATA_DIR = PROJECTIONS_PATH.parent.parent
+ROOKIE_DETAIL_FILES = {
+    "college": DATA_DIR / "processed" / "college_stats.csv",
+    "ages": DATA_DIR / "raw" / "rookie_ages.csv",
+    "positions": DATA_DIR / "raw" / "player_positions.csv",
+}
+
+
+def is_rookie(frame: pd.DataFrame) -> pd.Series:
+    """Rostered players with no NBA season who got the rookie projection."""
+    flag = frame["ROOKIE_PRIOR"] if "ROOKIE_PRIOR" in frame else pd.Series(False, index=frame.index)
+    return frame["NO_PRIOR_DATA"].eq(True) & flag.eq(True)
+
+
+@st.cache_data
+def _rookie_details(stamps: tuple) -> pd.DataFrame:
+    """Age, height, position and final college season keyed by PLAYER_ID."""
+    details = pd.DataFrame(columns=["PLAYER_ID"])
+    paths = ROOKIE_DETAIL_FILES
+    if paths["ages"].exists():
+        ages = pd.read_csv(paths["ages"], usecols=["PLAYER_ID", "AGE"])
+        details = details.merge(ages, on="PLAYER_ID", how="outer")
+    if paths["positions"].exists():
+        positions = pd.read_csv(paths["positions"], usecols=["PLAYER_ID", "POSITION", "HEIGHT_IN"])
+        details = details.merge(positions.drop_duplicates("PLAYER_ID"), on="PLAYER_ID", how="outer")
+    if paths["college"].exists():
+        college = pd.read_csv(paths["college"]).drop_duplicates("PLAYER_ID")
+        college = college[["PLAYER_ID", "TEAM", "COLLEGE_YEAR", "CLASS", "GP", "PTS", "TREB", "AST", "STL", "BLK", "BPM"]]
+        details = details.merge(college, on="PLAYER_ID", how="outer")
+    return details
+
+
+def rookie_details() -> pd.DataFrame:
+    """Rookie details, refreshed when any source file changes. Missing files leave blanks."""
+    stamps = tuple(path.stat().st_mtime if path.exists() else 0 for path in ROOKIE_DETAIL_FILES.values())
+    return _rookie_details(stamps)
+
+
+def height_text(inches: float) -> str:
+    return f"{int(inches) // 12}'{int(inches) % 12}\"" if pd.notna(inches) else ""
 
 
 def team_choices(league) -> list:

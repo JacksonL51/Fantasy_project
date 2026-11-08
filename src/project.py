@@ -42,8 +42,16 @@ from history import (
     fit_age_mpg_curve,
     fit_games_model,
     fit_role_curve,
+    fit_minutes_shrink,
+    fit_position_crowding,
     games_feature_table,
+    load_positions,
+    position_crowding,
+    position_mpg_adjustment,
     predict_games,
+    season_production_z as _season_production_z,
+    shrink_baseline_mpg,
+    team_mpg_adjustment,
     role_mpg_adjustment,
     season_production_z,
 )
@@ -54,6 +62,7 @@ from model import (
     load_model_bundle,
     predict_rates,
 )
+import rookies as R
 
 PROJECT_ROOT = PROCESSED_DIR.parents[1]
 ROSTERS_PATH = PROJECT_ROOT / "data" / "raw" / "current_rosters.csv"
@@ -104,6 +113,51 @@ RECENCY_WEIGHTS = {0: 0.60, 1: 0.27, 2: 0.13}
 #                 "fitted" = ridge model of next-season games (history.py)
 MPG_ADJUSTMENT = "age"
 GAMES_METHOD = "fitted"
+# POSITION_ADJUSTMENT: "fitted" = small MPG change from how crowded a player's position
+#                                 is on his team versus the team overall (history.py)
+#                      "none"   = no positional adjustment
+POSITION_ADJUSTMENT = "fitted"
+# TEAM_CROWD_ADJUSTMENT: "fitted" = also move raw MPG with overall team crowding (starters
+#                        too; the budget alone only moves bench minutes), shrunk by
+#                        TEAM_CROWD_SHRINK. "none" = budget only. Set from the allocation
+#                        backtest (backtest_recommendations.json).
+TEAM_CROWD_ADJUSTMENT = "none"
+TEAM_CROWD_SHRINK = 0.5
+# ALLOCATION_METHOD: how raw MPG x games become season minutes within a team.
+#   "anchored"     = top nine keep their minutes; rank 10+ share the leftovers by
+#                    cohort-blended baseline within 3-24 MPG (the original method)
+#   "raw_priority" = as anchored, but leftovers follow raw season minutes, floor 1 MPG
+#   "proportional" = everyone scaled by one team factor so the team totals 19,680
+#   "soft"         = the same factor raised to ALLOCATION_SOFT_POWER (partway there)
+#   "none"         = raw MPG x games, no team budget
+ALLOCATION_METHODS = ("anchored", "raw_priority", "proportional", "soft", "quality", "mpg_weighted", "none")
+ALLOCATION_METHOD = "mpg_weighted"
+ALLOCATION_SOFT_POWER = 0.25
+# "quality": the soft team total, but a team's cut (or extra minutes) is shared by
+# per-minute production instead of evenly: player i loses C x raw_i x exp(-beta q_i) /
+# sum(raw x exp(-beta q)), q = projected per-minute 9-cat value (league z-score).
+ALLOCATION_QUALITY_BETA = 1.0
+# "mpg_weighted": like "quality", but the cut is shared by each player's own MPG level
+# (lower-minute players give up more). quality_beta in project_rosters sets gamma.
+ALLOCATION_MPG_GAMMA = 2.0
+# MINUTES_SHRINK: "career" = pull short-career baseline MPG toward a typical value
+# (history.fit_minutes_shrink); "none" = off.
+MINUTES_SHRINK = "career"
+RAW_PRIORITY_MIN_MPG = 1.0
+# ROOKIE_METHOD: "draft"       = draft slot and age prior (rookies.py) for rookies'
+#                                rates, MPG and games, and as the shrinkage target
+#                                for early-career players with small samples
+#                "replacement" = old behavior (replacement rates, floor MPG, typical games)
+ROOKIE_METHOD = "draft"
+# Players who debuted in the latest this-many seasons shrink toward their rookie
+# prior instead of replacement level when their sample is small.
+EARLY_CAREER_SEASONS = 2
+# Stats whose rookie rates come from the draft prior; the rest stay at replacement.
+# User's choice: all stats. Rookie backtest, classes 2016-26 (per-36 error): the
+# prior beat replacement in 8+ of 11 classes for FGM, FGA, FG3M, FTM, FTA, REB,
+# BLK and PTS, but AST (1 of 11, 3.7% worse) and STL (3 of 11, 3.1% worse) lost
+# and TOV was a toss-up (7 of 11). To drop those three, remove them from this list.
+ROOKIE_RATE_STATS = list(TARGET_STATS)
 
 # Expected Games Played priors
 DEFAULT_STARTER_GP = 68.0
@@ -417,16 +471,161 @@ def build_inference_table(
 
 
 # --------------------------------------------------------------------------
+# Rookie priors (draft slot and age; see rookies.py)
+# --------------------------------------------------------------------------
+def rookie_priors(
+    table: pd.DataFrame,
+    history: pd.DataFrame,
+    draft: pd.DataFrame | None = None,
+    current_ages: pd.Series | None = None,
+    use_team_quality: bool = True,
+    use_playmaker: bool = True,
+) -> pd.DataFrame:
+    """Rookie prior rates, MPG and GAMES_82 for every row of `table`.
+
+    Models are fit on rookie seasons in `history` only, and rates are scaled by
+    the latest season's league rates, so a past-only history gives a leak-free
+    prior. Rows with no usable prior have HAS_ROOKIE_PRIOR = False.
+    """
+    draft = R.load_draft_history() if draft is None else draft
+    current_ages = R.load_rookie_ages() if current_ages is None else current_ages
+    seasons = R.rookie_seasons(history, draft, TARGET_STATS)
+    models = R.fit_rookie_models(
+        seasons, TARGET_STATS, use_team_quality=use_team_quality, use_playmaker=use_playmaker
+    )
+    league = R.league_rates(history, TARGET_STATS).iloc[-1]
+    features = R.prior_features(table["PLAYER_ID"], history, draft, current_ages)
+    # Team opportunity on the current roster, as in training: teammates' latest-season
+    # MPG (15+ games) and last season's minutes on this team by players now gone.
+    latest_year = int(history["SEASON_YEAR"].max())
+    last = history.loc[history["SEASON_YEAR"] == latest_year]
+    prior_mpg = (last["MIN"] / last["GP"]).where(last["GP"] >= 15).set_axis(last["PLAYER_ID"])
+    production = _season_production_z(last).set_index("PLAYER_ID")["PROD_Z"]
+    prior_ast = (last["AST_RATE"] * 36.0).where(last["GP"] >= 15).set_axis(last["PLAYER_ID"])
+    opportunity = R.team_opportunity(
+        pd.DataFrame(
+            {
+                "PLAYER_ID": table["PLAYER_ID"],
+                "TEAM": table["TEAM_ABBREVIATION"],
+                "PRIOR_MPG": table["PLAYER_ID"].map(prior_mpg),
+                "PRIOR_PROD": table["PLAYER_ID"].map(production),
+                "PRIOR_AST36": table["PLAYER_ID"].map(prior_ast),
+            }
+        ),
+        last.rename(columns={"TEAM_ABBREVIATION": "TEAM"})[["PLAYER_ID", "TEAM", "MIN"]],
+    )
+    features[R.OPPORTUNITY_FEATURES + ["TEAM_TOP_AST36_REL"]] = opportunity[
+        R.OPPORTUNITY_FEATURES + ["TEAM_TOP_AST36_REL"]
+    ]
+    priors = R.predict_rookies(models, features, league)
+    priors[["TEAM_CROWD", "VACATED_SHARE"]] = opportunity[["TOTAL_CROWD", "VACATED_SHARE"]]
+    priors["OVERALL_PICK"] = features["OVERALL_PICK"]
+    priors["HAS_ROOKIE_PRIOR"] = features["HAS_ROOKIE_PRIOR"]
+    # A true rookie has no NBA season at all. "No prior data" in the table also
+    # covers veterans back after 3+ seasons away (outside the recent window).
+    priors["ROOKIE"] = table["NO_PRIOR_DATA"] & ~features["NBA_HISTORY"]
+    print(
+        f"Rookie models: {models['rows']} rookie seasons "
+        f"({models['rate_rows']} with 200+ minutes for rates), classes through "
+        f"{models['last_class']}"
+    )
+    return priors
+
+
+def early_career(table: pd.DataFrame, latest_year: int) -> pd.Series:
+    """Players who debuted in the latest EARLY_CAREER_SEASONS seasons."""
+    first_year = pd.to_numeric(table.get("CAREER_FIRST_YEAR"), errors="coerce")
+    return (
+        ~table["NO_PRIOR_DATA"]
+        & first_year.ge(latest_year - EARLY_CAREER_SEASONS + 1).fillna(False)
+    )
+
+
+def shrink_targets(
+    table: pd.DataFrame,
+    replacement: pd.Series,
+    priors: pd.DataFrame | None,
+    latest_year: int,
+) -> pd.DataFrame:
+    """Per-player rates that small samples are blended toward.
+
+    Replacement level for everyone, except rookies and early-career players
+    with a rookie prior, who use that prior for ROOKIE_RATE_STATS.
+    Sets table["ROOKIE_PRIOR"].
+    """
+    targets = pd.DataFrame(
+        np.tile(replacement.reindex(TARGET_STATS).to_numpy(), (len(table), 1)),
+        index=table.index,
+        columns=TARGET_STATS,
+    )
+    use_prior = pd.Series(False, index=table.index)
+    if priors is not None:
+        use_prior = priors["HAS_ROOKIE_PRIOR"] & (
+            priors["ROOKIE"] | early_career(table, latest_year)
+        )
+        targets.loc[use_prior, ROOKIE_RATE_STATS] = priors.loc[use_prior, ROOKIE_RATE_STATS]
+    table["ROOKIE_PRIOR"] = use_prior
+    table["DRAFT_PICK"] = priors["OVERALL_PICK"] if priors is not None else np.nan
+    return targets
+
+
+def apply_rookie_minutes_and_games(
+    table: pd.DataFrame,
+    active_mpg: pd.Series,
+    proj_gp: pd.Series,
+    priors: pd.DataFrame | None,
+    latest_year: int,
+) -> tuple[pd.Series, pd.Series]:
+    """Rookies get prior MPG and games; early-career players with no 15-game
+    season get prior MPG. Also sets ALLOCATION_SEASON_MINUTES and
+    ROOKIE_MINUTES_PRIOR for the team allocation.
+    """
+    active_mpg = active_mpg.copy()
+    proj_gp = proj_gp.copy()
+    table["ALLOCATION_SEASON_MINUTES"] = table["WEIGHTED_SEASON_MINUTES"].fillna(0.0)
+    table["ROOKIE_MINUTES_PRIOR"] = False
+    if priors is None:
+        return active_mpg, proj_gp
+    has_prior = priors["HAS_ROOKIE_PRIOR"]
+    rookie = priors["ROOKIE"] & has_prior
+    no_mpg_yet = (
+        has_prior
+        & early_career(table, latest_year)
+        & table["ELIGIBLE_MPG_SEASONS"].fillna(0).eq(0)
+    )
+    mpg_rows = rookie | no_mpg_yet
+    active_mpg.loc[mpg_rows] = priors.loc[mpg_rows, "MPG"].clip(
+        MIN_HEALTHY_MPG, MAX_HEALTHY_MPG
+    )
+    proj_gp.loc[rookie] = priors.loc[rookie, "GAMES_82"]
+    # Predicted season minutes let a high pick claim a top-nine slot; the
+    # allocation takes them at full credibility (they are already a model prior).
+    table.loc[rookie, "ALLOCATION_SEASON_MINUTES"] = (
+        active_mpg.loc[rookie] * proj_gp.loc[rookie]
+    )
+    table.loc[rookie, "ROOKIE_MINUTES_PRIOR"] = True
+    print(
+        f"Rookie prior: {int(rookie.sum())} rookies; {int(no_mpg_yet.sum())} "
+        "early-career players use prior MPG"
+    )
+    return active_mpg, proj_gp
+
+
+# --------------------------------------------------------------------------
 # Steps 2-3: rate predictions with credibility blending
 # --------------------------------------------------------------------------
 def predict_with_credibility(
-    bundle: dict[str, object], table: pd.DataFrame, replacement: pd.Series
+    bundle: dict[str, object],
+    table: pd.DataFrame,
+    replacement: pd.Series | pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Model rates blended toward replacement for small or stale samples.
+    """Model rates blended toward a shrinkage target for small or stale samples.
 
     weight = clip(MIN_prior / 200, 0, 1). Stale rows are capped at 0.85, or at 0.5
     for players aged 31+ in their last season played.
-    Rookies have MIN_prior = 0, so they get pure replacement rates.
+    `replacement` is one rate per stat (Series, same for everyone) or a per-row
+    DataFrame (see shrink_targets). Rookies have MIN_prior = 0, so they get the
+    target rates exactly.
     """
     predicted = predict_rates(bundle, table)
     short = table["SHORT_SEASON_RETURN"]
@@ -457,15 +656,19 @@ def predict_with_credibility(
     )
     weight = weight.where(~table["STALE_DATA"], np.minimum(weight, stale_cap))
 
+    if isinstance(replacement, pd.DataFrame):
+        target = replacement.loc[table.index, TARGET_STATS].to_numpy(dtype=float)
+    else:
+        target = np.tile(replacement.reindex(TARGET_STATS).to_numpy(dtype=float), (len(table), 1))
     replacement_matrix = pd.DataFrame(
-        np.outer(1.0 - weight.to_numpy(), replacement.reindex(TARGET_STATS).to_numpy()),
+        (1.0 - weight.to_numpy())[:, None] * target,
         index=table.index,
         columns=TARGET_STATS,
     )
     blended = (predicted[TARGET_STATS].mul(weight, axis=0) + replacement_matrix).clip(
         lower=0.0
     )
-    print(f"Players blended toward replacement (weight < 1): {int((weight < 1).sum())}")
+    print(f"Players blended toward their shrinkage target (weight < 1): {int((weight < 1).sum())}")
     return blended, weight
 
 
@@ -484,13 +687,20 @@ def fit_minutes_curve(history: pd.DataFrame, method: str = MPG_ADJUSTMENT) -> di
 
 
 def raw_minutes_and_gp(
-    table: pd.DataFrame, curve: dict | None = None
+    table: pd.DataFrame, curve: dict | None = None, shrink: dict | None = None
 ) -> tuple[pd.Series, pd.Series, pd.Series]:
     """
     Return multi-season healthy MPG and the injury-adjusted model games estimate.
+    `shrink` (history.fit_minutes_shrink) pulls small-sample baselines toward a
+    typical MPG before the age adjustment.
     """
     def adjusted_mpg(baseline: pd.Series) -> pd.Series:
         mpg = baseline.fillna(MIN_HEALTHY_MPG)
+        if shrink is not None and shrink.get("active", False):
+            eligible = table["ELIGIBLE_MPG_SEASONS"].fillna(0) > 0
+            mpg = mpg.where(
+                ~eligible, shrink_baseline_mpg(shrink, mpg, table["PRIOR_CAREER_MINUTES"])
+            )
         if curve is not None and curve.get("active", False):
             # Players with real history only; rookies / no-data rows stay at the floor.
             if curve.get("kind", "age") == "role":
@@ -533,6 +743,39 @@ def raw_minutes_and_gp(
 
     blended_mpg = table["ELIGIBLE_MPG_SEASONS"].fillna(0).lt(3)
     return active_mpg, proj_gp, blended_mpg
+
+
+def position_adjustment(
+    table: pd.DataFrame,
+    latest_year: int,
+    model: dict,
+    positions: pd.Series | None = None,
+) -> pd.Series:
+    """MPG change from positional crowding on each player's current team.
+
+    Demand comes from teammates' latest-season MPG (15+ games), exactly as in the
+    fit; only players with such a season are adjusted. Sets table["POSITION_CROWD"].
+    """
+    positions = load_positions() if positions is None else positions
+    prior = (table["MIN"] / table["GP"]).where(
+        table["SEASON_YEAR"].eq(latest_year) & table["GP"].ge(15)
+    )
+    crowd = position_crowding(
+        pd.DataFrame(
+            {"PLAYER_ID": table["PLAYER_ID"], "TEAM": table["TEAM_ABBREVIATION"], "PRIOR_MPG": prior}
+        ),
+        positions,
+    )
+    table["POSITION_CROWD"] = crowd["POSITION_CROWD"]
+    table["TOTAL_CROWD"] = crowd["TOTAL_CROWD"]
+    table["CROWD_ELIGIBLE"] = prior.notna()
+    return position_mpg_adjustment(model, crowd["POSITION_CROWD"]).where(prior.notna(), 0.0)
+
+
+def team_crowd_adjustment(table: pd.DataFrame, model: dict, shrink: float) -> pd.Series:
+    """MPG change from overall team crowding (run position_adjustment first)."""
+    change = team_mpg_adjustment(model, table["TOTAL_CROWD"], shrink)
+    return change.where(table["CROWD_ELIGIBLE"], 0.0)
 
 
 def league_typical_games(history: pd.DataFrame) -> tuple[float, float]:
@@ -654,6 +897,9 @@ def allocate_team_season_minutes(
     prior_career_minutes: np.ndarray,
     ages: np.ndarray,
     target_total: float = TEAM_SEASON_MINUTES,
+    minutes_from_model: np.ndarray | None = None,
+    fringe_weighting: str = "baseline",
+    fringe_min_mpg: float = FRINGE_MIN_MPG,
 ) -> tuple[
     np.ndarray,
     np.ndarray,
@@ -667,6 +913,8 @@ def allocate_team_season_minutes(
     Anchor the top-nine healthy-MPG core and distribute remaining minutes by
     weighted-minute baseline. This keeps injury-shortened seasons from demoting
     established high-MPG players into the 12-MPG fringe pool.
+    `minutes_from_model` (bool per player) marks season minutes that are a model
+    prior (rookies); those are not blended again toward the cohort prior.
     """
     active_mpg = np.asarray(active_mpg, dtype=float)
     proj_gp = np.asarray(proj_gp, dtype=float)
@@ -746,6 +994,8 @@ def allocate_team_season_minutes(
         prior_career_minutes[tier4_indices]
         / MINUTES_CREDIBILITY_CAREER_MINUTES,
     )
+    if minutes_from_model is not None:
+        credibility[np.asarray(minutes_from_model, dtype=bool)] = 1.0
     minute_baseline[tier4_indices] = (
         credibility[tier4_indices] * weighted_season_minutes[tier4_indices]
         + (1.0 - credibility[tier4_indices]) * tier4_cohort_prior
@@ -765,15 +1015,18 @@ def allocate_team_season_minutes(
 
     # Tier 2/3 fringe players retain their individual weighted-minute baseline.
     fringe_weights = minute_baseline[fringe_indices]
+    if fringe_weighting == "raw":
+        # Leftovers follow each player's own raw season minutes, not the cohort blend.
+        fringe_weights = active_mpg[fringe_indices] * proj_gp[fringe_indices]
     if (fringe_weights <= 0).any():
         raise ValueError("Every fringe player must have a positive minute baseline.")
 
     fringe_gp = projected_gp[fringe_indices]
-    lower = fringe_gp * FRINGE_MIN_MPG
+    lower = fringe_gp * fringe_min_mpg
     upper = fringe_gp * FRINGE_MAX_MPG
     if remaining < lower.sum() - 1e-8 or remaining > upper.sum() + 1e-8:
         raise ValueError(
-            "Team fringe minutes cannot be reconciled within the 3-24 MPG "
+            f"Team fringe minutes cannot be reconciled within the {fringe_min_mpg:g}-24 MPG "
             f"bounds: remaining={remaining:.2f}, "
             f"feasible=[{lower.sum():.2f}, {upper.sum():.2f}]."
         )
@@ -807,7 +1060,7 @@ def allocate_team_season_minutes(
     season_minutes[fringe_indices] = fringe_minutes
     norm_active_mpg = season_minutes / projected_gp
     if (
-        (norm_active_mpg[fringe_indices] < FRINGE_MIN_MPG - 1e-8).any()
+        (norm_active_mpg[fringe_indices] < fringe_min_mpg - 1e-8).any()
         or (norm_active_mpg[fringe_indices] > FRINGE_MAX_MPG + 1e-8).any()
     ):
         raise ValueError("Fringe MPG is outside the configured allocation bounds.")
@@ -827,22 +1080,67 @@ def allocate_team_season_minutes(
     )
 
 
+def per_minute_value(rates: pd.DataFrame, minutes: pd.Series) -> pd.Series:
+    """Projected per-minute 9-cat value, as a z-score against players with 500+ minutes.
+
+    Same components as history.season_production_z: seven counting rates (turnovers
+    negated) and FG/FT impact per minute, each standardized, then averaged.
+    """
+    pool = minutes >= 500
+    if pool.sum() < 30:
+        pool = minutes > 0
+    fg = (rates.loc[pool, "FGM"] * minutes[pool]).sum() / (rates.loc[pool, "FGA"] * minutes[pool]).sum()
+    ft = (rates.loc[pool, "FTM"] * minutes[pool]).sum() / (rates.loc[pool, "FTA"] * minutes[pool]).sum()
+    parts = pd.DataFrame(
+        {
+            "PTS": rates["PTS"], "FG3M": rates["FG3M"], "REB": rates["REB"], "AST": rates["AST"],
+            "STL": rates["STL"], "BLK": rates["BLK"], "TOV": -rates["TOV"],
+            "FG": rates["FGM"] - fg * rates["FGA"], "FT": rates["FTM"] - ft * rates["FTA"],
+        }
+    )
+    reference = parts.loc[pool]
+    score = ((parts - reference.mean()) / reference.std(ddof=0).replace(0.0, 1.0)).mean(axis=1)
+    return (score - score[pool].mean()) / score[pool].std(ddof=0)
+
+
 def allocate_all_teams(
     table: pd.DataFrame,
     active_mpg: pd.Series,
-    proj_gp: pd.Series
+    proj_gp: pd.Series,
+    method: str | None = None,
+    quality: pd.Series | None = None,
+    quality_beta: float | None = None,
 ) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Season minutes per player under ALLOCATION_METHOD (see its comment)."""
+    method = method or ALLOCATION_METHOD
+    if method not in ALLOCATION_METHODS:
+        raise ValueError(f"Unknown ALLOCATION_METHOD: {method}")
+    fringe_options = (
+        {"fringe_weighting": "raw", "fringe_min_mpg": RAW_PRIORITY_MIN_MPG}
+        if method == "raw_priority"
+        else {}
+    )
     norm_mpg = pd.Series(np.nan, index=table.index, name="PROJECTED_MPG")
     norm_season_min = pd.Series(np.nan, index=table.index, name="PROJECTED_SEASON_MIN")
     final_gp = pd.Series(np.nan, index=table.index, name="PROJECTED_GP")
 
+    minutes_column = (
+        "ALLOCATION_SEASON_MINUTES"
+        if "ALLOCATION_SEASON_MINUTES" in table.columns
+        else "WEIGHTED_SEASON_MINUTES"
+    )
+    from_model = (
+        table["ROOKIE_MINUTES_PRIOR"].eq(True)
+        if "ROOKIE_MINUTES_PRIOR" in table.columns
+        else pd.Series(False, index=table.index)
+    )
     for team, index in table.groupby("TEAM_ABBREVIATION").groups.items():
         try:
             m, s, gp, tiers, baseline, credibility, cohort_prior = (
                 allocate_team_season_minutes(
                     active_mpg.loc[index].to_numpy(),
                     proj_gp.loc[index].to_numpy(),
-                    table.loc[index, "WEIGHTED_SEASON_MINUTES"]
+                    table.loc[index, minutes_column]
                     .fillna(0.0)
                     .to_numpy(),
                     table.loc[index, "PRIOR_CAREER_MINUTES"]
@@ -851,6 +1149,8 @@ def allocate_all_teams(
                     pd.to_numeric(
                         table.loc[index, "AGE"], errors="coerce"
                     ).to_numpy(),
+                    minutes_from_model=from_model.loc[index].to_numpy(),
+                    **fringe_options,
                 )
             )
         except ValueError as error:
@@ -863,6 +1163,41 @@ def allocate_all_teams(
         table.loc[index, "MINUTES_CREDIBILITY"] = credibility
         table.loc[index, "COHORT_PRIOR_MINUTES"] = cohort_prior
 
+    if method in ("quality", "mpg_weighted"):
+        raw = active_mpg * proj_gp
+        teams = table["TEAM_ABBREVIATION"]
+        raw_total = raw.groupby(teams).transform("sum")
+        soft_total = raw_total * (TEAM_SEASON_MINUTES / raw_total) ** ALLOCATION_SOFT_POWER
+        change = soft_total - raw_total  # negative = minutes to cut
+        if method == "quality":
+            if quality is None:
+                raise ValueError('ALLOCATION_METHOD "quality" needs per-minute values.')
+            beta = ALLOCATION_QUALITY_BETA if quality_beta is None else quality_beta
+            q = quality.reindex(raw.index).fillna(0.0).clip(-3.0, 3.0)
+            # Cuts fall on lower-value players; extra minutes go to higher-value players.
+            share = raw * np.exp(np.where(change < 0, -beta, beta) * q)
+        else:
+            # Cuts fall on lower-minute players: share ~ raw x (MPG / 25) ^ -gamma, so a
+            # 35-MPG starter gives up less per minute than a 15-MPG reserve.
+            gamma = ALLOCATION_MPG_GAMMA if quality_beta is None else quality_beta
+            relative = (active_mpg / 25.0).clip(lower=0.2)
+            share = raw * relative ** np.where(change < 0, -gamma, gamma)
+        share = share / share.groupby(teams).transform("sum")
+        floor = proj_gp * RAW_PRIORITY_MIN_MPG
+        season = (raw + change * share).clip(lower=floor)
+        final_gp = proj_gp.rename("PROJECTED_GP")
+        norm_mpg = (season / final_gp).clip(upper=MAX_HEALTHY_MPG + 3).rename("PROJECTED_MPG")
+        norm_season_min = (norm_mpg * final_gp).rename("PROJECTED_SEASON_MIN")
+        return norm_mpg, norm_season_min, final_gp
+    if method in ("proportional", "soft", "none"):
+        # Every player's raw season minutes scaled by the same team factor (fully,
+        # partly, or not at all), so no group takes the whole cut.
+        power = {"proportional": 1.0, "soft": ALLOCATION_SOFT_POWER, "none": 0.0}[method]
+        raw = active_mpg * proj_gp
+        factor = TEAM_SEASON_MINUTES / raw.groupby(table["TEAM_ABBREVIATION"]).transform("sum")
+        norm_season_min = (raw * factor**power).rename("PROJECTED_SEASON_MIN")
+        final_gp = proj_gp.rename("PROJECTED_GP")
+        norm_mpg = (norm_season_min / final_gp).rename("PROJECTED_MPG")
     return norm_mpg, norm_season_min, final_gp
 
 
@@ -920,6 +1255,9 @@ def synthesize_stats(
     projections["STALE_DATA"] = table["STALE_DATA"]
     projections["SHORT_SEASON_RETURN"] = table["SHORT_SEASON_RETURN"]
     projections["MPG_BLENDED"] = mpg_blended
+    projections["ROOKIE_PRIOR"] = table.get("ROOKIE_PRIOR", False)
+    projections["DRAFT_PICK"] = table.get("DRAFT_PICK", np.nan)
+    projections["POSITION_CROWD"] = table.get("POSITION_CROWD", np.nan)
     projections["LAST_PTS_PG"] = table["PTS_RATE"] * table["MIN"] / table["GP"]
     
     return projections
@@ -944,18 +1282,28 @@ def validate_projections(projections: pd.DataFrame) -> None:
         raise ValueError("Projected games and season minutes must be positive.")
 
     # Check each team's full-season minutes total (not per-game minutes).
+    # "soft" and "none" do not force teams to the budget, so they skip this check.
     team_season_minutes = projections.groupby("TEAM_ABBREVIATION")["PROJECTED_SEASON_MIN"].sum()
     off = team_season_minutes[(team_season_minutes - TEAM_SEASON_MINUTES).abs() > 1.0]
+    if ALLOCATION_METHOD in ("soft", "quality", "mpg_weighted", "none"):
+        off = off.iloc[0:0]
     if len(off):
         raise ValueError(
             f"Teams not summing to {TEAM_SEASON_MINUTES} total season minutes "
             f"within 1 minute:\n{off}"
         )
 
-    print(
-        "Hard checks passed: finite, non-negative, teams sum to "
-        "19,680 season minutes."
-    )
+    if ALLOCATION_METHOD in ("soft", "quality", "mpg_weighted", "none"):
+        print(
+            "Hard checks passed: finite, non-negative. Team season minutes "
+            f"({ALLOCATION_METHOD}): {team_season_minutes.min():,.0f} to "
+            f"{team_season_minutes.max():,.0f}, mean {team_season_minutes.mean():,.0f}."
+        )
+    else:
+        print(
+            "Hard checks passed: finite, non-negative, teams sum to "
+            "19,680 season minutes."
+        )
 
 def _print_console_table(table: pd.DataFrame) -> None:
     text = table.to_string(index=False)
@@ -990,18 +1338,72 @@ def print_review(projections: pd.DataFrame) -> None:
     )
 
 
-def main() -> None:
-    bundle = load_model_bundle()
-    roster = load_roster()
-    history = load_history()
-    latest, latest_year = latest_season_rows(history)
+def project_rosters(
+    bundle: dict[str, object],
+    roster: pd.DataFrame,
+    history: pd.DataFrame,
+    latest: tuple[pd.DataFrame, int] | None = None,
+    rookie_method: str | None = None,
+    position_method: str | None = None,
+    team_crowd_method: str | None = None,
+    team_crowd_shrink: float | None = None,
+    allocation_method: str | None = None,
+    quality_beta: float | None = None,
+    minutes_shrink: str | None = None,
+    rookie_team_quality: bool = True,
+    rookie_playmaker: bool = True,
+    draft: pd.DataFrame | None = None,
+    current_ages: pd.Series | None = None,
+) -> pd.DataFrame:
+    """The whole projection for `roster` from `history` (seasons that may be used).
+
+    Methods default to the module switches. The backtest passes past-only
+    history, rebuilt rosters and `latest` (precomputed latest_season_rows).
+    """
+    rookie_method = rookie_method or ROOKIE_METHOD
+    position_method = position_method or POSITION_ADJUSTMENT
+    team_crowd_method = team_crowd_method or TEAM_CROWD_ADJUSTMENT
+    team_crowd_shrink = TEAM_CROWD_SHRINK if team_crowd_shrink is None else team_crowd_shrink
+    latest, latest_year = latest if latest is not None else latest_season_rows(history)
     replacement = replacement_rates(latest, latest_year, bundle)
     table = build_inference_table(roster, latest, latest_year, replacement)
+    if rookie_method == "draft":
+        priors = rookie_priors(
+            table, history, draft, current_ages, rookie_team_quality, rookie_playmaker
+        )
+    elif rookie_method == "replacement":
+        priors = None
+    else:
+        raise ValueError(f"Unknown ROOKIE_METHOD: {rookie_method}")
+    targets = shrink_targets(table, replacement, priors, latest_year)
 
-    rates, weight = predict_with_credibility(bundle, table, replacement)
+    rates, weight = predict_with_credibility(bundle, table, targets)
     curve = fit_minutes_curve(history)
     print(f"MPG adjustment ({MPG_ADJUSTMENT}): {curve}")
-    active_mpg, model_gp, mpg_blended = raw_minutes_and_gp(table, curve)
+    minutes_shrink = minutes_shrink or MINUTES_SHRINK
+    if minutes_shrink not in ("career", "none"):
+        raise ValueError(f"Unknown MINUTES_SHRINK: {minutes_shrink}")
+    shrink = fit_minutes_shrink(history) if minutes_shrink == "career" else None
+    if shrink is not None:
+        print(f"Minutes shrink: {shrink}")
+    active_mpg, model_gp, mpg_blended = raw_minutes_and_gp(table, curve, shrink)
+    if position_method not in ("fitted", "none"):
+        raise ValueError(f"Unknown POSITION_ADJUSTMENT: {position_method}")
+    if team_crowd_method not in ("fitted", "none"):
+        raise ValueError(f"Unknown TEAM_CROWD_ADJUSTMENT: {team_crowd_method}")
+    if "fitted" in (position_method, team_crowd_method):
+        crowding_model = fit_position_crowding(history)
+        print(f"Crowding model: {crowding_model}")
+        shift = position_adjustment(table, latest_year, crowding_model)
+        if position_method == "none":
+            shift = shift * 0.0
+        if team_crowd_method == "fitted":
+            shift = shift + team_crowd_adjustment(table, crowding_model, team_crowd_shrink)
+        active_mpg = (active_mpg + shift).clip(MIN_HEALTHY_MPG, MAX_HEALTHY_MPG)
+        print(
+            f"Crowding MPG change: {int((shift != 0).sum())} players, "
+            f"range {shift.min():+.2f} to {shift.max():+.2f}"
+        )
     typical_starter_gp, typical_bench_gp = league_typical_games(history)
     proj_gp = blend_projected_games(
         table, model_gp, typical_starter_gp, typical_bench_gp
@@ -1012,8 +1414,22 @@ def main() -> None:
         proj_gp = fitted_games(table, games_model, proj_gp)
     elif GAMES_METHOD != "blend":
         raise ValueError(f"Unknown GAMES_METHOD: {GAMES_METHOD}")
-    mpg, season_min, proj_gp = allocate_all_teams(table, active_mpg, proj_gp)
-    projections = synthesize_stats(table, rates, active_mpg, proj_gp, mpg, season_min, weight, mpg_blended)
+    active_mpg, proj_gp = apply_rookie_minutes_and_games(
+        table, active_mpg, proj_gp, priors, latest_year
+    )
+    method = allocation_method or ALLOCATION_METHOD
+    quality = per_minute_value(rates, active_mpg * proj_gp) if method == "quality" else None
+    mpg, season_min, proj_gp = allocate_all_teams(
+        table, active_mpg, proj_gp, method, quality, quality_beta
+    )
+    return synthesize_stats(table, rates, active_mpg, proj_gp, mpg, season_min, weight, mpg_blended)
+
+
+def main() -> None:
+    bundle = load_model_bundle()
+    roster = load_roster()
+    history = load_history()
+    projections = project_rosters(bundle, roster, history)
 
     validate_projections(projections)
     projections = projections.sort_values(
@@ -1046,6 +1462,9 @@ def main() -> None:
         "STALE_DATA",
         "SHORT_SEASON_RETURN",
         "MPG_BLENDED",
+        "ROOKIE_PRIOR",
+        "DRAFT_PICK",
+        "POSITION_CROWD",
         "LAST_PTS_PG",
     ]
     metadata_columns = [

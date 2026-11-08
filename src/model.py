@@ -85,12 +85,10 @@ FEATURES_BY_STAT = {
 ALPHA_GRID = (0.01, 0.1, 1.0, 10.0)
 MODEL_FORMULATIONS = ("level", "delta")
 N_VALIDATION_FOLDS = 2  # the most recent N target seasons become folds
-# With a long history, older eras may differ from today's game. Set this to an
-# integer (e.g. 12) to train only on the most recent N target seasons before
-# each fold; None uses every earlier transition.
+# With a long history, older eras may differ from today's game. 
 TRAIN_WINDOW_YEARS: int | None = None
 # NOTE: training_pairs.csv already filters MIN_prior >= 200, so 200 removes
-# nothing here. Raise it (e.g. 800) to rank only fantasy-relevant players.
+# nothing 
 RANKING_MINUTES_THRESHOLD = 200.0
 BOOTSTRAP_ITERATIONS = 2000
 BOOTSTRAP_SEED = 20261028

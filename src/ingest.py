@@ -3,7 +3,13 @@ import time
 from typing import Iterable, List
 
 import pandas as pd
-from nba_api.stats.endpoints import commonallplayers, leaguedashplayerstats
+from nba_api.stats.endpoints import (
+    commonallplayers,
+    commonplayerinfo,
+    drafthistory,
+    leaguedashplayerstats,
+    playerindex,
+)
 from nba_api.stats.library.parameters import Season
 from nba_api.stats.library import http as stats_http
 
@@ -11,7 +17,15 @@ RAW_DATA_DIR = os.path.join("data", "raw")
 PROCESSED_DATA_DIR = os.path.join("data", "processed")
 HISTORICAL_STATS_PATH = os.path.join(RAW_DATA_DIR, "historical_stats.csv")
 CURRENT_ROSTERS_PATH = os.path.join(RAW_DATA_DIR, "current_rosters.csv")
+DRAFT_HISTORY_PATH = os.path.join(RAW_DATA_DIR, "draft_history.csv")
+ROOKIE_AGES_PATH = os.path.join(RAW_DATA_DIR, "rookie_ages.csv")
+PLAYER_POSITIONS_PATH = os.path.join(RAW_DATA_DIR, "player_positions.csv")
 NBA_STATS_FIRST_SEASON_START_YEAR = 1996
+DRAFT_HISTORY_COLUMNS = [
+    "PERSON_ID", "PLAYER_NAME", "SEASON", "ROUND_NUMBER", "ROUND_PICK",
+    "OVERALL_PICK", "DRAFT_TYPE", "TEAM_ABBREVIATION", "ORGANIZATION",
+    "ORGANIZATION_TYPE",
+]
 
 # Custom browser headers to avoid stats.nba.com silent drops
 CUSTOM_HEADERS = {
@@ -353,6 +367,148 @@ def fetch_current_rosters(season: str = "2026-27", force_refresh: bool = False) 
     print(f"Saved current rosters to {CURRENT_ROSTERS_PATH} ({len(df)} rows).")
     return df
 
+def fetch_draft_history() -> pd.DataFrame:
+    """Every NBA draft pick (one request). Refreshed each run; a failed fetch keeps the saved file."""
+    ensure_dirs()
+    try:
+        raw_df = _fetch_with_retry(
+            lambda: drafthistory.DraftHistory(timeout=60).get_data_frames()[0],
+            label="Draft history fetch",
+        )
+        _validate_columns(raw_df, set(DRAFT_HISTORY_COLUMNS), "Draft history")
+    except Exception as exc:
+        if os.path.exists(DRAFT_HISTORY_PATH):
+            print(f"Draft history fetch failed ({exc}); keeping {DRAFT_HISTORY_PATH}.")
+            return pd.read_csv(DRAFT_HISTORY_PATH)
+        raise
+    df = raw_df[DRAFT_HISTORY_COLUMNS].copy()
+    df.to_csv(DRAFT_HISTORY_PATH, index=False)
+    print(
+        f"Saved draft history to {DRAFT_HISTORY_PATH} ({len(df)} picks, "
+        f"{df['SEASON'].min()}-{df['SEASON'].max()})."
+    )
+    return df
+
+
+def _height_inches(height) -> float:
+    """'6-10' -> 82.0; blank or malformed -> NaN."""
+    parts = str(height).split("-")
+    if len(parts) != 2 or not all(part.strip().isdigit() for part in parts):
+        return float("nan")
+    return float(int(parts[0]) * 12 + int(parts[1]))
+
+
+def fetch_player_positions(season: str = "2026-27") -> pd.DataFrame:
+    """Listed position, height and weight for every player, current and retired (one request).
+
+    POSITION is the NBA's coarse label (G, F, C, G-F, F-G, F-C, C-F), one per player
+    for the whole career. COLLEGE and COUNTRY are kept for later college-stat matching.
+    Refreshed each run; a failed fetch keeps the saved file.
+    """
+    ensure_dirs()
+    try:
+        raw_df = _fetch_with_retry(
+            lambda: playerindex.PlayerIndex(
+                season=season, historical_nullable=1, timeout=60
+            ).get_data_frames()[0],
+            label="Player index fetch",
+        )
+        _validate_columns(raw_df, {"PERSON_ID", "POSITION", "HEIGHT", "WEIGHT"}, "Player index")
+    except Exception as exc:
+        if os.path.exists(PLAYER_POSITIONS_PATH):
+            print(f"Player index fetch failed ({exc}); keeping {PLAYER_POSITIONS_PATH}.")
+            return pd.read_csv(PLAYER_POSITIONS_PATH)
+        raise
+    df = pd.DataFrame(
+        {
+            "PLAYER_ID": pd.to_numeric(raw_df["PERSON_ID"], errors="coerce"),
+            "PLAYER_NAME": (
+                raw_df["PLAYER_FIRST_NAME"].fillna("") + " " + raw_df["PLAYER_LAST_NAME"].fillna("")
+            ).str.strip(),
+            "POSITION": raw_df["POSITION"].replace("", pd.NA),
+            "HEIGHT_IN": raw_df["HEIGHT"].map(_height_inches),
+            "WEIGHT_LB": pd.to_numeric(raw_df["WEIGHT"], errors="coerce"),
+            "COLLEGE": raw_df.get("COLLEGE"),
+            "COUNTRY": raw_df.get("COUNTRY"),
+        }
+    ).dropna(subset=["PLAYER_ID"])
+    df["PLAYER_ID"] = df["PLAYER_ID"].astype("int64")
+    df = df.drop_duplicates("PLAYER_ID", keep="last")
+    df.to_csv(PLAYER_POSITIONS_PATH, index=False)
+    print(
+        f"Saved positions to {PLAYER_POSITIONS_PATH} ({len(df)} players, "
+        f"{int(df['POSITION'].notna().sum())} with a position)."
+    )
+    return df
+
+
+def _age_on_feb_1(birthdate: str, season_end_year: int) -> float:
+    """Whole-year age on 1 February of the season, close to the NBA's AGE column."""
+    born = pd.to_datetime(birthdate, errors="coerce")
+    if pd.isna(born):
+        return float("nan")
+    reference = pd.Timestamp(year=season_end_year, month=2, day=1)
+    years = reference.year - born.year - ((reference.month, reference.day) < (born.month, born.day))
+    return float(years)
+
+
+def fetch_rookie_ages(roster_df: pd.DataFrame, season: str = "2026-27") -> pd.DataFrame:
+    """Ages for rostered players with no completed NBA season (current rookies).
+
+    Uses the in-progress season's league stats first (same AGE definition as the
+    history), then one player-info call per rookie who has not played yet.
+    Writes data/raw/rookie_ages.csv; a failed fetch keeps the saved file.
+    """
+    ensure_dirs()
+    known = set()
+    if os.path.exists(HISTORICAL_STATS_PATH):
+        known = set(pd.to_numeric(pd.read_csv(HISTORICAL_STATS_PATH, usecols=["PLAYER_ID"])["PLAYER_ID"], errors="coerce").dropna().astype(int))
+    roster_ids = pd.to_numeric(roster_df["PLAYER_ID"], errors="coerce").dropna().astype(int)
+    rookies = sorted(set(roster_ids) - known)
+    season_end_year = int(season[:4]) + 1
+    print(f"Fetching ages for {len(rookies)} rostered players with no NBA history...")
+
+    try:
+        current = _fetch_with_retry(
+            lambda: leaguedashplayerstats.LeagueDashPlayerStats(
+                season=season, per_mode_detailed="Totals", timeout=60
+            ).get_data_frames()[0],
+            label=f"In-progress {season} stats",
+        )
+        current_age = dict(zip(current["PLAYER_ID"].astype(int), pd.to_numeric(current["AGE"], errors="coerce")))
+    except Exception as exc:
+        print(f"In-progress season stats failed ({exc}); using player-info calls only.")
+        current_age = {}
+
+    records = []
+    for player_id in rookies:
+        age = current_age.get(player_id, float("nan"))
+        source = "season_stats"
+        if pd.isna(age):
+            source = "birthdate"
+            try:
+                info = _fetch_with_retry(
+                    lambda: commonplayerinfo.CommonPlayerInfo(
+                        player_id=player_id, timeout=60
+                    ).get_data_frames()[0],
+                    label=f"Player info {player_id}",
+                )
+                age = _age_on_feb_1(info["BIRTHDATE"].iloc[0], season_end_year)
+                time.sleep(0.8)
+            except Exception as exc:
+                print(f"No birth date for player {player_id}: {exc}")
+                age, source = float("nan"), "missing"
+        records.append({"PLAYER_ID": player_id, "AGE": age, "AGE_SOURCE": source, "SEASON": season})
+
+    df = pd.DataFrame(records, columns=["PLAYER_ID", "AGE", "AGE_SOURCE", "SEASON"])
+    if df["AGE"].isna().all() and len(df) and os.path.exists(ROOKIE_AGES_PATH):
+        print(f"No rookie ages fetched; keeping {ROOKIE_AGES_PATH}.")
+        return pd.read_csv(ROOKIE_AGES_PATH)
+    df.to_csv(ROOKIE_AGES_PATH, index=False)
+    print(f"Saved rookie ages to {ROOKIE_AGES_PATH} ({df['AGE'].notna().sum()} of {len(df)} found).")
+    return df
+
+
 def tidy_raw_stats(df: pd.DataFrame) -> pd.DataFrame:
     cleaned = df.copy()
 
@@ -381,4 +537,7 @@ if __name__ == "__main__":
     print("Starting data ingestion phase...")
     roster_df = fetch_current_rosters()
     fetch_historical_stats(roster_player_ids=roster_df["PLAYER_ID"].unique())
+    fetch_draft_history()
+    fetch_rookie_ages(roster_df)
+    fetch_player_positions()
     print("Data ingestion complete.")
