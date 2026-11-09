@@ -1043,6 +1043,18 @@ ALLOCATION_VARIANTS = {
     "soft_budget_no_playmaker": {"rookie_method": "draft", "position_method": "fitted",
                                  "team_crowd_method": "none", "allocation_method": "soft",
                                  "rookie_playmaker": False},
+    # Usage branch: team usage limit (USAGE_BUDGET) and usage that left or arrived
+    # (USAGE_REDISTRIBUTION). "current" uses the module switches.
+    "usage_budget_none": {"rookie_method": "draft", "position_method": "fitted",
+                          "team_crowd_method": "none", "usage_budget": "none"},
+    "usage_budget_all": {"rookie_method": "draft", "position_method": "fitted",
+                         "team_crowd_method": "none", "usage_budget": "all"},
+    "usage_redistribution_none": {"rookie_method": "draft", "position_method": "fitted",
+                                  "team_crowd_method": "none", "usage_redistribution": "none"},
+    "usage_redistribution_all": {"rookie_method": "draft", "position_method": "fitted",
+                                 "team_crowd_method": "none", "usage_redistribution": "fitted"},
+    "usage_none": {"rookie_method": "draft", "position_method": "fitted", "team_crowd_method": "none",
+                   "usage_redistribution": "none", "usage_budget": "none"},
     **{
         f"quality_{beta:g}": {
             "rookie_method": "draft", "position_method": "fitted", "team_crowd_method": "none",
@@ -1083,6 +1095,12 @@ def _allocation_metrics(
     if minutes_column != "PROJECTED_SEASON_MIN":
         # Same rates, different season minutes.
         projected = projected.mul(p[minutes_column] / p["PROJECTED_SEASON_MIN"], axis=0)
+    # Per-36 rate errors (minute-weighted by actual minutes): what the usage switches move.
+    for stat in ("PTS", "FGA", "FTA", "TOV", "AST"):
+        projected_rate = p[f"TOTAL_{stat}"] / p["PROJECTED_SEASON_MIN"].where(p["PROJECTED_SEASON_MIN"] > 0)
+        error = ((projected_rate - a[f"{stat}_RATE"]) * 36).abs()
+        valid = error.notna()
+        out[f"{stat}36_MAE"] = float(np.average(error[valid], weights=a.loc[valid, "MIN"]))
     out["VALUE_Spearman"] = _spearman(
         _nine_cat_value(projected), _nine_cat_value(_season_totals(a, "actual"))
     )
@@ -1195,7 +1213,8 @@ def run_allocation(years: list[int] | None = None) -> None:
 
     shown = results.loc[results["Group"].isin(["500+ actual minutes", "starters_24_plus_actual", "rookies"])]
     columns = [
-        c for c in ["MPG_MAE", "MPG_Bias", "SEASON_MIN_MAE", "SEASON_MIN_Spearman", "VALUE_Spearman"]
+        c for c in ["MPG_MAE", "MPG_Bias", "SEASON_MIN_MAE", "SEASON_MIN_Spearman", "VALUE_Spearman",
+                    "PTS36_MAE", "FGA36_MAE", "TOV36_MAE"]
         if c in shown.columns
     ]
     for (year, group), table in shown.groupby(["Target_Year", "Group"], sort=True):

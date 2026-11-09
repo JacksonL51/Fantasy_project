@@ -54,6 +54,9 @@ from history import (
     team_mpg_adjustment,
     role_mpg_adjustment,
     season_production_z,
+    season_usage,
+    team_usage_changes,
+    usage_change_history,
 )
 from history import load_history as _load_history
 from model import (
@@ -158,6 +161,37 @@ EARLY_CAREER_SEASONS = 2
 # BLK and PTS, but AST (1 of 11, 3.7% worse) and STL (3 of 11, 3.1% worse) lost
 # and TOV was a toss-up (7 of 11). To drop those three, remove them from this list.
 ROOKIE_RATE_STATS = list(TARGET_STATS)
+# USAGE_BUDGET (team usage limit, Usage branch): after the minutes budget, each team's
+# projected shot volume V = (FGA + 0.44 FTA + TOV) per team minute, relative to the
+# average team, and veterans' shot rates (USAGE_BUDGET_STATS) are multiplied by
+# (1 / V) ** USAGE_BUDGET_POWER. The pipeline spreads teams about twice as far apart as
+# they really end up (2026: Washington +12% projected vs +4% actual). Allocation backtest
+# 2024-26, 500+ min players: PTS/36 error 1.907/1.939/2.166 -> 1.887/1.908/2.120, FGA and
+# FTA better all three years, TOV equal or better, value rank -0.001 to 0.
+#   "veterans" = scale everyone but players with no prior data (rookies' college-based
+#                rates got worse every year when scaled); "all" = everyone; "none" = off.
+USAGE_BUDGET = "veterans"
+USAGE_BUDGET_POWER = 0.5  # 1.0 (all the way to the average team) was worse than 0.5
+USAGE_BUDGET_STATS = ["FGA", "FGM", "FG3M", "FTA", "FTM", "PTS", "TOV"]
+# USAGE_REDISTRIBUTION (usage that left or arrived, Usage branch): returning players'
+# rates move with the share of their current team's last-season possessions used by
+# players who left (VACATED_REL) and by arrivals (ARRIVED_REL), both relative to the
+# average team (training uses end-of-season teams, projection opening rosters). Fitted at
+# run time on the rate model's residuals (fit_usage_redistribution); FGM and FTM follow
+# FGA and FTA so percentages hold. Held-out 2014-26 (both features as model inputs):
+# TOV better 13/13 years, PTS 12/13, FGA 11/13, about 1%; strongest for stayers on teams
+# that lost half their usage. But in the allocation backtest on top of USAGE_BUDGET, all
+# five stats made PTS worse in 2 of 3 seasons; turnovers alone pass (500+ min TOV/36
+# error 0.310/0.333/0.366 -> 0.307/0.332/0.366, starters 0.301/0.329/0.350 ->
+# 0.299/0.327/0.350, value same or +0.001, rookies unchanged).
+#   "tov"    = turnovers only (current)
+#   "fitted" = all of USAGE_REDISTRIBUTION_STATS (FGM/FTM follow FGA/FTA)
+#   "none"   = off
+USAGE_REDISTRIBUTION = "tov"
+USAGE_REDISTRIBUTION_STATS = ["PTS", "FGA", "FTA", "AST", "TOV"]
+USAGE_REDISTRIBUTION_METHODS = {"tov": ["TOV"], "fitted": USAGE_REDISTRIBUTION_STATS, "none": []}
+USAGE_REDISTRIBUTION_FOLLOW = {"FGM": "FGA", "FTM": "FTA"}
+USAGE_REDISTRIBUTION_MIN_MINUTES = 200.0  # both seasons of a training pair (training_pairs rule)
 
 # Expected Games Played priors
 DEFAULT_STARTER_GP = 68.0
@@ -670,6 +704,113 @@ def predict_with_credibility(
     )
     print(f"Players blended toward their shrinkage target (weight < 1): {int((weight < 1).sum())}")
     return blended, weight
+
+
+# --------------------------------------------------------------------------
+# Usage: team usage that left or arrived, and the team usage limit
+# --------------------------------------------------------------------------
+def _usage_pairs(history: pd.DataFrame) -> pd.DataFrame:
+    """Consecutive-season pairs (both 200+ minutes) with the rate models' inputs as of t,
+    the t+1 rates, and the t+1 end-of-season team's usage changes."""
+    h = history.sort_values(["PLAYER_ID", "SEASON_YEAR"])
+    rate_cols = [f"{stat}_RATE" for stat in TARGET_STATS]
+    prior = h[["PLAYER_ID", "SEASON_YEAR", "AGE", "MIN", *rate_cols]].rename(
+        columns={"AGE": "AGE_prior", "MIN": "MIN_prior", **{c: f"{c}_prior" for c in rate_cols}}
+    )
+    target = h[["PLAYER_ID", "SEASON_YEAR", "TEAM_ABBREVIATION", "MIN", *rate_cols]].rename(
+        columns={"MIN": "MIN_target", **{c: f"{c}_target" for c in rate_cols}}
+    )
+    target["SEASON_YEAR"] -= 1
+    pairs = prior.merge(target, on=["PLAYER_ID", "SEASON_YEAR"])
+    pairs = pairs.loc[
+        (pairs["MIN_prior"] >= USAGE_REDISTRIBUTION_MIN_MINUTES)
+        & (pairs["MIN_target"] >= USAGE_REDISTRIBUTION_MIN_MINUTES)
+        & pairs["AGE_prior"].notna()
+    ].copy()
+    pairs["AGE_SQ"] = pairs["AGE_prior"] ** 2
+    pairs = pairs.merge(
+        compute_history_features(history, TARGET_STATS), on=["PLAYER_ID", "SEASON_YEAR"], how="left"
+    )
+    changes = usage_change_history(history)
+    changes["SEASON_YEAR"] -= 1
+    return pairs.merge(changes, on=["SEASON_YEAR", "TEAM_ABBREVIATION"], how="inner")
+
+
+def fit_usage_redistribution(
+    history: pd.DataFrame, bundle: dict[str, object], stats: list[str] | None = None
+) -> dict:
+    """Per stat in `stats` (default USAGE_REDISTRIBUTION_STATS), minute-weighted least
+    squares of the rate model's residual (actual next rate minus predict_rates) on
+    VACATED_REL and ARRIVED_REL. Only the slopes are used. Pass past-only history and a
+    bundle trained on it (the backtest does)."""
+    stats = USAGE_REDISTRIBUTION_STATS if stats is None else stats
+    pairs = _usage_pairs(history)
+    if len(pairs) < 300:
+        return {"active": False, "pairs": int(len(pairs))}
+    predicted = predict_rates(bundle, pairs)
+    design = np.column_stack([np.ones(len(pairs)), pairs["VACATED_REL"], pairs["ARRIVED_REL"]])
+    sw = np.sqrt(pairs["MIN_target"].to_numpy(dtype=float))
+    coef = {}
+    for stat in stats:
+        residual = (pairs[f"{stat}_RATE_target"] - predicted[stat]).to_numpy(dtype=float)
+        b, *_ = np.linalg.lstsq(design * sw[:, None], residual * sw, rcond=None)
+        coef[stat] = {"VACATED_REL": round(float(b[1]), 5), "ARRIVED_REL": round(float(b[2]), 5)}
+    return {"active": True, "pairs": int(len(pairs)), "coef": coef}
+
+
+def current_usage_changes(roster: pd.DataFrame, history: pd.DataFrame, latest_year: int) -> pd.DataFrame:
+    """team_usage_changes for the roster's teams against the latest season."""
+    usage = season_usage(history)
+    current = roster.drop_duplicates("PLAYER_ID").set_index("PLAYER_ID")["TEAM_ABBREVIATION"]
+    return team_usage_changes(usage.loc[usage["SEASON_YEAR"] == latest_year], current)
+
+
+def apply_usage_redistribution(
+    table: pd.DataFrame, rates: pd.DataFrame, weight: pd.Series, model: dict, changes: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """Shift returning players' rates for each stat in the model by the fitted slopes x
+    their team's usage changes, scaled by credibility weight. FGM/FTM follow FGA/FTA when
+    those are shifted. Players with no prior data are unchanged."""
+    team = table["TEAM_ABBREVIATION"]
+    vacated = team.map(changes["VACATED_REL"]).astype(float).fillna(0.0)
+    arrived = team.map(changes["ARRIVED_REL"]).astype(float).fillna(0.0)
+    if not model.get("active", False):
+        return rates, vacated, arrived
+    scale = weight.where(~table["NO_PRIOR_DATA"], 0.0)
+    out = rates.copy()
+    for stat, c in model["coef"].items():
+        out[stat] = rates[stat] + scale * (c["VACATED_REL"] * vacated + c["ARRIVED_REL"] * arrived)
+    out = out.clip(lower=0.0)
+    for stat, source in USAGE_REDISTRIBUTION_FOLLOW.items():
+        if source not in model["coef"]:
+            continue
+        ratio = (out[source] / rates[source]).where(rates[source] > 0, 1.0)
+        out[stat] = rates[stat] * ratio
+    return out, vacated, arrived
+
+
+def apply_usage_budget(
+    table: pd.DataFrame, rates: pd.DataFrame, season_min: pd.Series,
+    method: str = USAGE_BUDGET, power: float = USAGE_BUDGET_POWER,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Scale shot rates by (1 / team volume) ** power (see USAGE_BUDGET). Volume counts
+    every rostered player; method "veterans" leaves players with no prior data alone."""
+    if method not in ("veterans", "all", "none"):
+        raise ValueError(f"Unknown USAGE_BUDGET: {method}")
+    scale = pd.Series(1.0, index=table.index)
+    if method == "none" or power == 0:
+        return rates, scale
+    team = table["TEAM_ABBREVIATION"]
+    minutes = season_min.fillna(0.0)
+    poss = (rates["FGA"] + 0.44 * rates["FTA"] + rates["TOV"]) * minutes
+    volume = poss.groupby(team).sum() / minutes.groupby(team).sum()
+    volume = volume / volume.mean()
+    scale = team.map((1.0 / volume) ** power).astype(float)
+    if method == "veterans":
+        scale = scale.where(~table["NO_PRIOR_DATA"].astype(bool), 1.0)
+    out = rates.copy()
+    out[USAGE_BUDGET_STATS] = rates[USAGE_BUDGET_STATS].mul(scale, axis=0)
+    return out, scale
 
 
 # --------------------------------------------------------------------------
@@ -1352,6 +1493,8 @@ def project_rosters(
     minutes_shrink: str | None = None,
     rookie_team_quality: bool = True,
     rookie_playmaker: bool = True,
+    usage_budget: str | None = None,
+    usage_redistribution: str | None = None,
     draft: pd.DataFrame | None = None,
     current_ages: pd.Series | None = None,
 ) -> pd.DataFrame:
@@ -1378,6 +1521,17 @@ def project_rosters(
     targets = shrink_targets(table, replacement, priors, latest_year)
 
     rates, weight = predict_with_credibility(bundle, table, targets)
+    usage_redistribution = usage_redistribution or USAGE_REDISTRIBUTION
+    if usage_redistribution not in USAGE_REDISTRIBUTION_METHODS:
+        raise ValueError(f"Unknown USAGE_REDISTRIBUTION: {usage_redistribution}")
+    changes = current_usage_changes(roster, history, latest_year)
+    usage_model = {"active": False}
+    if usage_redistribution != "none":
+        usage_model = fit_usage_redistribution(
+            history, bundle, USAGE_REDISTRIBUTION_METHODS[usage_redistribution]
+        )
+        print(f"Usage redistribution: {usage_model}")
+    rates, vacated, arrived = apply_usage_redistribution(table, rates, weight, usage_model, changes)
     curve = fit_minutes_curve(history)
     print(f"MPG adjustment ({MPG_ADJUSTMENT}): {curve}")
     minutes_shrink = minutes_shrink or MINUTES_SHRINK
@@ -1422,7 +1576,14 @@ def project_rosters(
     mpg, season_min, proj_gp = allocate_all_teams(
         table, active_mpg, proj_gp, method, quality, quality_beta
     )
-    return synthesize_stats(table, rates, active_mpg, proj_gp, mpg, season_min, weight, mpg_blended)
+    rates, usage_scale = apply_usage_budget(table, rates, season_min, usage_budget or USAGE_BUDGET)
+    if (usage_scale != 1.0).any():
+        print(f"Usage budget: shot-rate scale {usage_scale.min():.3f} to {usage_scale.max():.3f}")
+    projections = synthesize_stats(table, rates, active_mpg, proj_gp, mpg, season_min, weight, mpg_blended)
+    projections["USAGE_BUDGET_SCALE"] = usage_scale
+    projections["TEAM_VACATED_USAGE_REL"] = vacated
+    projections["TEAM_ARRIVED_USAGE_REL"] = arrived
+    return projections
 
 
 def main() -> None:
@@ -1466,6 +1627,9 @@ def main() -> None:
         "DRAFT_PICK",
         "POSITION_CROWD",
         "LAST_PTS_PG",
+        "USAGE_BUDGET_SCALE",
+        "TEAM_VACATED_USAGE_REL",
+        "TEAM_ARRIVED_USAGE_REL",
     ]
     metadata_columns = [
         column for column in metadata_columns if column in csv_projections.columns
