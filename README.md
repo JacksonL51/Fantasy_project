@@ -92,6 +92,12 @@ by git, and the pipeline never reads or changes it.
   because season totals need the average outcome, including the occasional major injury.
 - **Team budget:** each team's projected minutes add up to a full season (82 games of 240
   minutes). The top nine players keep their own minutes, and the rest share what's left.
+- **Team shot limit:** a team full of high-usage players can't all keep their usual shot
+  volume. After the minutes budget, each team's projected shots, free throws and turnovers
+  per minute are pulled halfway back toward the average team (rookies are left alone). This
+  cut points, shot and free-throw errors in all three backtest seasons. Turnovers also move
+  a little with how much of a team's usage left or arrived since last season (players on
+  teams that lost usage turn it over slightly more).
 - **Fantasy value:** the sum of each player's 9 category scores, compared with players
   projected for 500+ minutes. A strong player's single worst category counts less.
 
@@ -126,7 +132,8 @@ src/
   dashboard.py           app entry point
   app_shared.py          app data loading, tables and styling
   app_pages/             the Rankings, My Team and Trade Analyzer pages
-tests/                   unit tests for team analysis and saving
+analysis/                one-off test scripts (usage tests) and their results
+tests/                   unit tests for team analysis, saving, rookies and usage
 data/raw/                downloaded data (not in git)
 data/processed/          pipeline outputs (not in git)
 data/league/             your saved teams (not in git)
@@ -139,7 +146,8 @@ python -m unittest discover tests
 ```
 
 The tests cover team stats, trade comparisons (including uneven trades), saving teams and
-team names. The projection pipeline is checked by the backtest instead.
+team names, rookie priors and the usage measures. The projection pipeline as a whole is
+checked by the backtest instead.
 
 ## Known limitations
 

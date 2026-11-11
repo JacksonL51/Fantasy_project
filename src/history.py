@@ -730,3 +730,130 @@ def shrink_baseline_mpg(model: dict, mpg: pd.Series, career_minutes: pd.Series) 
     career = pd.to_numeric(career_minutes, errors="coerce").fillna(0.0)
     weight = (career / model["career_minutes"]).clip(0.0, 1.0)
     return weight * mpg + (1.0 - weight) * model["target"]
+
+
+# --------------------------------------------------------------------------
+# Usage measures (Usage branch, tests only so far: nothing in the pipeline calls these)
+# --------------------------------------------------------------------------
+# Team totals are sums of the player rows for each (team, season). The data credits a
+# traded player's whole season to his last team, so those teams' totals are blurred.
+USAGE_SHRINK_MINUTES = PROD_SHRINK_MINUTES  # value pulled toward average by MIN / (MIN + this)
+USAGE_FT_WEIGHT = 0.44
+USAGE_COLUMNS = ["USG", "AST_PCT", "REB_SHARE"]
+
+
+def season_usage(history: pd.DataFrame) -> pd.DataFrame:
+    """Per-season usage measures for every player-season, from that season's rows only.
+
+    USG = (FGA + 0.44 FTA + TOV) per minute on court as a share of his team's
+    (classic USG%: 0.20 = average, team members' minute-weighted shares sum to 1).
+    AST_PCT = AST / (teammates' made shots while on court), estimated as
+    AST / (MIN / (team MIN / 5) * team FGM - FGM).
+    REB_SHARE = rebounds per minute on court as a share of the team's (no opponent
+    rebounds in the data, so this is a share of team rebounds, not REB%).
+    Team totals are sums of player rows (traded players count for their last team).
+    `[col]_S` columns are pulled toward that season's league average by
+    MIN / (MIN + USAGE_SHRINK_MINUTES), like the production score.
+    """
+    h = history[["PLAYER_ID", "SEASON_YEAR", "TEAM_ABBREVIATION", "MIN"]].copy()
+    for stat in ("FGA", "FTA", "TOV", "AST", "FGM", "REB"):
+        h[stat] = history[f"{stat}_RATE"].to_numpy(dtype=float) * history["MIN"].to_numpy(dtype=float)
+    h["POSS"] = h["FGA"] + USAGE_FT_WEIGHT * h["FTA"] + h["TOV"]
+    team = h.groupby(["SEASON_YEAR", "TEAM_ABBREVIATION"])[["MIN", "POSS", "FGM", "REB"]].transform("sum")
+    on_court = h["MIN"] / (team["MIN"] / 5.0)  # share of the team's games he was on court
+    with np.errstate(divide="ignore", invalid="ignore"):
+        h["USG"] = h["POSS"] / (on_court * team["POSS"])
+        h["AST_PCT"] = h["AST"] / (on_court * team["FGM"] - h["FGM"])
+        h["REB_SHARE"] = h["REB"] / (on_court * team["REB"])
+    h["AST_PCT"] = h["AST_PCT"].where(h["AST_PCT"].between(0.0, 1.0))
+    weight = h["MIN"] / (h["MIN"] + USAGE_SHRINK_MINUTES)
+    for column in USAGE_COLUMNS:
+        valid = h[column].notna() & np.isfinite(h[column])
+        league = (
+            (h[column].where(valid, 0.0) * h["MIN"]).groupby(h["SEASON_YEAR"]).transform("sum")
+            / h["MIN"].where(valid, 0.0).groupby(h["SEASON_YEAR"]).transform("sum")
+        )
+        h[f"{column}_LEAGUE"] = league
+        h[f"{column}_S"] = (weight * h[column].where(valid, league) + (1.0 - weight) * league)
+    keep = ["PLAYER_ID", "SEASON_YEAR", "TEAM_ABBREVIATION", "MIN", "POSS"]
+    keep += USAGE_COLUMNS + [f"{c}_S" for c in USAGE_COLUMNS] + [f"{c}_LEAGUE" for c in USAGE_COLUMNS]
+    return h[keep].reset_index(drop=True)
+
+
+def usage_feature_table(
+    history: pd.DataFrame,
+    window_years: int = HISTORY_WINDOW_YEARS,
+    decay: float = HISTORY_DECAY,
+) -> pd.DataFrame:
+    """Usage features per (PLAYER_ID, SEASON_YEAR t), using only seasons <= t.
+
+    `[col]_S`: season t's shrunk value (season_usage). `[col]_HIST`: seasons t-2..t
+    averaged with weights decay**years_back * MIN (as compute_history_features), then
+    shrunk toward season t's league average by window minutes / (minutes + 400).
+    """
+    usage = season_usage(history).sort_values(["PLAYER_ID", "SEASON_YEAR"])
+    out = usage[["PLAYER_ID", "SEASON_YEAR"] + [f"{c}_S" for c in USAGE_COLUMNS]].copy()
+    hist_values = {c: np.full(len(usage), np.nan) for c in USAGE_COLUMNS}
+    years = usage["SEASON_YEAR"].to_numpy()
+    minutes = usage["MIN"].to_numpy(dtype=float)
+    ids = usage["PLAYER_ID"].to_numpy()
+    raw = {c: usage[c].to_numpy(dtype=float) for c in USAGE_COLUMNS}
+    league = {c: usage[f"{c}_LEAGUE"].to_numpy(dtype=float) for c in USAGE_COLUMNS}
+    starts = np.r_[0, np.flatnonzero(ids[1:] != ids[:-1]) + 1, len(ids)]
+    for a, b in zip(starts[:-1], starts[1:]):
+        for i in range(a, b):
+            back = years[i] - years[a : i + 1]
+            keep = back < window_years
+            w = (decay ** back[keep]) * minutes[a : i + 1][keep]
+            total_minutes = minutes[a : i + 1][keep].sum()
+            shrink = total_minutes / (total_minutes + USAGE_SHRINK_MINUTES)
+            for c in USAGE_COLUMNS:
+                v = raw[c][a : i + 1][keep]
+                ok = np.isfinite(v)
+                mean = (v[ok] * w[ok]).sum() / w[ok].sum() if ok.any() and w[ok].sum() > 0 else league[c][i]
+                hist_values[c][i] = shrink * mean + (1.0 - shrink) * league[c][i]
+    for c in USAGE_COLUMNS:
+        out[f"{c}_HIST"] = hist_values[c]
+    return out.reset_index(drop=True)
+
+
+def team_usage_changes(previous: pd.DataFrame, current_team: pd.Series) -> pd.DataFrame:
+    """Usage that left and arrived, per current team, relative to the average team.
+
+    `previous`: one season's season_usage rows (PLAYER_ID, TEAM_ABBREVIATION, POSS).
+    `current_team`: PLAYER_ID -> team now (end-of-season teams in training, opening
+    rosters in projection). VACATED = share of the team's previous possessions used by
+    players no longer on it (traded, released or retired); ARRIVED = previous-season
+    possessions of players now on it who were elsewhere, over the same team total.
+    _REL subtracts the average team, so opening rosters (fewer arrivals so far) and
+    end-of-season rosters stay comparable. Rookies count in neither.
+    """
+    prev = previous[["PLAYER_ID", "TEAM_ABBREVIATION", "POSS"]].copy()
+    prev["NOW"] = prev["PLAYER_ID"].map(current_team)
+    team_poss = prev.groupby("TEAM_ABBREVIATION")["POSS"].sum()
+    moved = prev["NOW"] != prev["TEAM_ABBREVIATION"]
+    vacated = prev.loc[moved].groupby("TEAM_ABBREVIATION")["POSS"].sum()
+    arrived = prev.loc[prev["NOW"].notna() & moved].groupby("NOW")["POSS"].sum()
+    teams = pd.Index(sorted(set(current_team.dropna().unique()) & set(team_poss.index)))
+    out = pd.DataFrame(
+        {
+            "VACATED": vacated.reindex(teams).fillna(0.0) / team_poss.reindex(teams),
+            "ARRIVED": arrived.reindex(teams).fillna(0.0) / team_poss.reindex(teams),
+        },
+        index=teams,
+    )
+    for column in ("VACATED", "ARRIVED"):
+        out[f"{column}_REL"] = out[column] - out[column].mean()
+    out.index.name = "TEAM_ABBREVIATION"
+    return out
+
+
+def usage_change_history(history: pd.DataFrame) -> pd.DataFrame:
+    """team_usage_changes for every (target season, end-of-season team), seasons <= target."""
+    usage = season_usage(history)
+    rows = []
+    for year in sorted(usage["SEASON_YEAR"].unique())[1:]:
+        current = usage.loc[usage["SEASON_YEAR"] == year].set_index("PLAYER_ID")["TEAM_ABBREVIATION"]
+        changes = team_usage_changes(usage.loc[usage["SEASON_YEAR"] == year - 1], current)
+        rows.append(changes.reset_index().assign(SEASON_YEAR=int(year)))
+    return pd.concat(rows, ignore_index=True)
