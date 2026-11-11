@@ -7,7 +7,9 @@ from app_shared import (
     PER_GAME,
     SEASON_TOTALS,
     STAT_LABELS,
+    PRESEASON,
     plain_text,
+    projection_view_control,
     require_players,
     stat_prefix,
     table_html,
@@ -105,7 +107,7 @@ def on_header_click() -> None:
 
 
 @st.fragment
-def full_rankings(players: pd.DataFrame, show_colors: bool) -> None:
+def full_rankings(players: pd.DataFrame, show_colors: bool, projection_view: str = "") -> None:
     """Search, filters and table. A fragment, so typing does not redraw the rest of the page."""
     search_col, team_col, view_col = st.columns([4, 4, 3])
     search = search_col.text_input(
@@ -132,7 +134,7 @@ def full_rankings(players: pd.DataFrame, show_colors: bool) -> None:
                 shown, view, sort_key, descending,
                 fixed_height=True, show_colors=show_colors, sortable=True,
             ),
-            "rows_key": f"{search}|{teams}|{view}|{sort_key}|{descending}",
+            "rows_key": f"{projection_view}|{search}|{teams}|{view}|{sort_key}|{descending}",
         },
         on_sort_change=on_header_click,
     )
@@ -140,9 +142,16 @@ def full_rankings(players: pd.DataFrame, show_colors: bool) -> None:
 
 def render() -> None:
     st.title("NBA Fantasy Projections")
-    players, modified = require_players()
+    projection_view = projection_view_control()
+    players, modified = require_players(projection_view)
+    detail = (
+        "82-game season with injuries known heading into it"
+        if projection_view == PRESEASON
+        else "games played so far and today's injuries"
+    )
     st.caption(
-        f"{len(players)} rostered players · Projections updated {modified:%b %d, %Y}"
+        f"{len(players)} rostered players · {projection_view}: {detail} · "
+        f"Projections updated {modified:%b %d, %Y}"
     )
 
     st.subheader("Top 10")
@@ -153,7 +162,7 @@ def render() -> None:
     st.html(table_html(players.head(10), PER_GAME, show_colors=show_colors))
 
     st.subheader("Full rankings")
-    full_rankings(players, show_colors)
+    full_rankings(players, show_colors, projection_view)
 
     with st.expander("How to read these numbers"):
         st.markdown(
@@ -167,5 +176,11 @@ def render() -> None:
             "- **Rookies:** projected from draft pick, age, college stats, height and team "
             "opportunity; see the Rookies page.\n"
             "- **No recent NBA seasons:** players back after years away get replacement-level "
-            "stats."
+            "stats.\n"
+            "- **Current vs Preseason:** both use the same per-game model. Current counts games "
+            "already played and today's injuries; Preseason is a full 82 games minus injuries "
+            "known heading into the season, found from who missed their team's opening games "
+            "(so it uses hindsight, and a player who wasn't in the rotation can look injured). "
+            "Correct those in data/raw/injury_overrides_preseason.csv. Players out for the "
+            "season are left out of both. Teammates of injured players get the extra minutes."
         )

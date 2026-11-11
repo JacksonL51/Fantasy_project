@@ -16,6 +16,9 @@ import pandas as pd
 PROCESSED_DIR = Path(__file__).resolve().parent.parent / "data" / "processed"
 PROJECTIONS_PATH = PROCESSED_DIR / "projections_by_team.csv"
 RANKINGS_PATH = PROCESSED_DIR / "player_rankings.csv"
+# Preseason view (injuries known heading into the season; see project.py).
+PRESEASON_PROJECTIONS_PATH = PROCESSED_DIR / "projections_preseason.csv"
+PRESEASON_RANKINGS_PATH = PROCESSED_DIR / "player_rankings_preseason.csv"
 
 # Value baselines come from this pool, the same 500-minute cut the backtest scores on.
 # Deep-bench players would otherwise drag the averages down and compress the top.
@@ -93,14 +96,22 @@ def main() -> None:
         raise FileNotFoundError(
             f"No projections found at {PROJECTIONS_PATH}. Run `python src/project.py` first."
         )
-    rankings = rank_players(pd.read_csv(PROJECTIONS_PATH))
-    rankings.to_csv(RANKINGS_PATH, index=False)
-    print(f"Wrote {len(rankings)} players to {RANKINGS_PATH}")
-    print(
-        rankings.head(TOP_TO_PRINT)[["RANK", "PLAYER_NAME", "TEAM_ABBREVIATION", "VALUE"]]
-        .round(2)
-        .to_string(index=False)
-    )
+    # Preseason first (if project.py wrote it), current last so its top list prints last.
+    for label, source, target in (
+        ("preseason", PRESEASON_PROJECTIONS_PATH, PRESEASON_RANKINGS_PATH),
+        ("current", PROJECTIONS_PATH, RANKINGS_PATH),
+    ):
+        if not source.exists():
+            print(f"No {source}; skipping {label} rankings.")
+            continue
+        rankings = rank_players(pd.read_csv(source))
+        rankings.to_csv(target, index=False)
+        print(f"[{label}] wrote {len(rankings)} players to {target}")
+        print(
+            rankings.head(TOP_TO_PRINT)[["RANK", "PLAYER_NAME", "TEAM_ABBREVIATION", "VALUE"]]
+            .round(2)
+            .to_string(index=False)
+        )
 
 
 if __name__ == "__main__":

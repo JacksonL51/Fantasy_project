@@ -138,6 +138,48 @@ class InjuryGamesTests(unittest.TestCase):
         self.assertEqual(new.iloc[1], 0)
 
 
+class PreseasonTests(unittest.TestCase):
+    def setUp(self):
+        from datetime import date, timedelta
+
+        self.today = date(2026, 11, 11)
+        opening = date(2026, 10, 20)
+        dates = [opening + timedelta(days=2 * n) for n in range(10)]
+        rows = []
+        for n, d in enumerate(dates):
+            rows.append((1, d, f"g{n}"))  # Lively: played every game
+            if n >= 4:
+                rows.append((3, d, f"g{n}"))  # Jalen Williams: missed the first 4, then played
+            if n >= 1:
+                rows.append((2, d, f"g{n}"))  # Jokic: missed only the opener
+        self.log = pd.DataFrame(rows, columns=["PLAYER_ID", "GAME_DATE", "GAME_ID"])
+        self.log["TEAM_ABBREVIATION"] = self.log["PLAYER_ID"].map({1: "DAL", 2: "DAL", 3: "DAL", 4: "DAL"})
+        self.roster = ROSTER.assign(TEAM_ABBREVIATION="DAL")
+        # Jaylin Williams (4) never played: today 6 games out ahead.
+        self.current = pd.DataFrame(
+            {"PLAYER_ID": [1, 2, 3, 4], "GAMES_OUT_AHEAD": [0.0, 0.0, 0.0, 6.0],
+             "OUT_FOR_SEASON": [False] * 4, "RETURN_DATE": [None, None, None, None]}
+        )
+        self.empty = pd.DataFrame(columns=inj.PRESEASON_OVERRIDE_COLUMNS)
+
+    def test_streaks_and_still_out(self):
+        g = inj.preseason_injury_games(self.roster, self.current, self.log, self.empty, self.today).set_index("PLAYER_ID")
+        self.assertTrue(g["INJURY_STATUS"].isna()[[1, 2]].all())  # opener only is below the 3-game line
+        self.assertEqual(g.at[3, "GAMES_OUT_AHEAD"], 4)
+        self.assertEqual(g.at[4, "GAMES_OUT_AHEAD"], 10 + 6)
+        self.assertTrue((g["TEAM_GAMES_LEFT"] == 82).all() and (g["GAMES_PLAYED"] == 0).all())
+
+    def test_overrides(self):
+        overrides = pd.DataFrame(
+            {"PLAYER_ID": pd.array([3, 2], dtype="Int64"), "PLAYER_NAME": [None, None],
+             "STATUS": ["ACTIVE", "OUT"], "GAMES_OUT": [None, 20.0], "NOTE": [None, None]}
+        )
+        g = inj.preseason_injury_games(self.roster, self.current, self.log, overrides, self.today).set_index("PLAYER_ID")
+        self.assertTrue(pd.isna(g.at[3, "INJURY_STATUS"]))
+        self.assertEqual(g.at[3, "GAMES_OUT_AHEAD"], 0)
+        self.assertEqual(g.at[2, "GAMES_OUT_AHEAD"], 20)
+
+
 class OpportunityTests(unittest.TestCase):
     def test_absence_moves_minutes_and_rates_to_teammates(self):
         import opportunity as opp

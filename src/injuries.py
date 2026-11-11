@@ -362,6 +362,162 @@ def load_injury_games(today: date | None = None, roster: pd.DataFrame | None = N
     return injury_games(roster, load_current_injuries(), load_schedule(), season_log, today)
 
 
+# --------------------------------------------------------------------------
+# Preseason: injuries heading into the season (hindsight from game logs)
+# --------------------------------------------------------------------------
+# No archive of opening-night injury reports is available (the NBA's is blocked), so the
+# preseason view uses hindsight, as the user chose: a player who missed his team's first
+# PRESEASON_MIN_STREAK+ games is treated as hurt entering the season. If he has played
+# since, he misses exactly that streak; if not, the streak plus today's known games out
+# (and out for season if that is today's verdict). Game logs can't tell injury from rest,
+# a coach's decision or a late signing; the preseason override file corrects those.
+PRESEASON_MIN_STREAK = 3
+PRESEASON_OVERRIDES_PATH = os.path.join(RAW_DATA_DIR, "injury_overrides_preseason.csv")
+PRESEASON_OVERRIDE_COLUMNS = ["PLAYER_ID", "PLAYER_NAME", "STATUS", "GAMES_OUT", "NOTE"]
+PRESEASON_STATUSES = {"OUT", "OFS", "ACTIVE"}
+
+
+def load_preseason_overrides(path: str = PRESEASON_OVERRIDES_PATH) -> pd.DataFrame:
+    """Hand-edited preseason corrections; created with just a header if missing.
+
+    STATUS: OUT (misses GAMES_OUT games from opening night), OFS (whole season) or
+    ACTIVE (healthy on opening night: cancels a game-log detection).
+    """
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        pd.DataFrame(columns=PRESEASON_OVERRIDE_COLUMNS).to_csv(path, index=False)
+        print(f"Created empty preseason override file {path}.")
+    df = pd.read_csv(path, dtype={"PLAYER_NAME": str, "STATUS": str, "NOTE": str})
+    for column in PRESEASON_OVERRIDE_COLUMNS:
+        if column not in df.columns:
+            df[column] = pd.NA
+    df["STATUS"] = df["STATUS"].fillna("").str.strip().str.upper()
+    bad = df[~df["STATUS"].isin(PRESEASON_STATUSES) | (df["STATUS"].eq("OUT") & df["GAMES_OUT"].isna())]
+    if not bad.empty:
+        raise ValueError(
+            f"{path}: STATUS must be one of {sorted(PRESEASON_STATUSES)} (OUT needs GAMES_OUT); "
+            f"bad rows: {bad[['PLAYER_NAME', 'STATUS']].to_dict('records')}"
+        )
+    df["PLAYER_ID"] = pd.to_numeric(df["PLAYER_ID"], errors="coerce").astype("Int64")
+    df["GAMES_OUT"] = pd.to_numeric(df["GAMES_OUT"], errors="coerce")
+    return df[PRESEASON_OVERRIDE_COLUMNS]
+
+
+def preseason_injury_games(
+    roster: pd.DataFrame,
+    current_games: pd.DataFrame,
+    season_log: pd.DataFrame,
+    overrides: pd.DataFrame | None = None,
+    today: date | None = None,
+) -> pd.DataFrame:
+    """Same columns as injury_games, for an 82-game season seen from opening night.
+
+    `current_games` is injury_games for today (gives games out ahead / out for season for
+    players who haven't played yet).
+    """
+    today = today or date.today()
+    if "PLAYER_NAME" not in roster.columns:  # project.load_roster calls it ROSTER_NAME
+        roster = roster.rename(columns={"ROSTER_NAME": "PLAYER_NAME"})
+    roster = roster[["PLAYER_ID", "TEAM_ABBREVIATION", "PLAYER_NAME"]].copy()
+    roster["PLAYER_ID"] = pd.to_numeric(roster["PLAYER_ID"]).astype("int64")
+    log = season_log.copy()
+    if len(log):
+        log["GAME_DATE"] = pd.to_datetime(log["GAME_DATE"]).dt.date
+        log = log[log["GAME_DATE"] < today]
+    team_dates = log.groupby("TEAM_ABBREVIATION")["GAME_DATE"].apply(lambda d: sorted(set(d)))
+    first_game = log.groupby("PLAYER_ID")["GAME_DATE"].min()
+    current = current_games.set_index("PLAYER_ID")
+
+    out = roster.set_index("PLAYER_ID")
+    streaks, played_since, back_dates = [], [], []
+    for pid, team in out["TEAM_ABBREVIATION"].items():
+        dates = team_dates.get(team, [])
+        first = first_game.get(pid)
+        if first is None or pd.isna(first):
+            streaks.append(len(dates))
+            played_since.append(False)
+            back_dates.append(None)
+        else:
+            streaks.append(sum(d < first for d in dates))
+            played_since.append(True)
+            back_dates.append(first)
+    out["OPENING_GAMES_MISSED"] = streaks
+    out["GAMES_PLAYED"] = 0
+    out["TEAM_GAMES_PLAYED"] = 0
+    out["TEAM_GAMES_LEFT"] = SEASON_GAMES
+    out["INJURY_STATUS"] = pd.Series([None] * len(out), index=out.index, dtype=object)
+    out["RETURN_DATE"] = pd.Series([None] * len(out), index=out.index, dtype=object)
+    out["GAMES_OUT_AHEAD"] = 0.0
+    out["OUT_FOR_SEASON"] = False
+    out["PRESEASON_SOURCE"] = pd.Series([None] * len(out), index=out.index, dtype=object)
+
+    flagged = out["OPENING_GAMES_MISSED"] >= PRESEASON_MIN_STREAK
+    for pid, since, back in zip(out.index, played_since, back_dates):
+        if not flagged.at[pid]:
+            continue
+        missed = out.at[pid, "OPENING_GAMES_MISSED"]
+        out.at[pid, "PRESEASON_SOURCE"] = "game_logs"
+        if since:
+            out.at[pid, "INJURY_STATUS"] = "OUT"
+            out.at[pid, "GAMES_OUT_AHEAD"] = float(missed)
+            out.at[pid, "RETURN_DATE"] = back
+            continue
+        now = current.loc[pid] if pid in current.index else None
+        if now is not None and bool(now["OUT_FOR_SEASON"]):
+            out.at[pid, "INJURY_STATUS"] = "OFS"
+            out.at[pid, "OUT_FOR_SEASON"] = True
+            out.at[pid, "GAMES_OUT_AHEAD"] = float(SEASON_GAMES)
+            continue
+        ahead = float(now["GAMES_OUT_AHEAD"]) if now is not None else 0.0
+        out.at[pid, "INJURY_STATUS"] = "OUT"
+        out.at[pid, "GAMES_OUT_AHEAD"] = float(missed) + ahead
+        out.at[pid, "RETURN_DATE"] = now["RETURN_DATE"] if now is not None else None
+
+    overrides = overrides if overrides is not None else load_preseason_overrides()
+    if len(overrides):
+        overrides = overrides.copy()
+        missing = overrides["PLAYER_ID"].isna()
+        if missing.any():
+            overrides.loc[missing, "PLAYER_ID"] = match_players(
+                overrides.loc[missing, "PLAYER_NAME"],
+                pd.Series(pd.NA, index=overrides.index[missing]),
+                roster,
+            )
+        unmatched = overrides[overrides["PLAYER_ID"].isna() | ~overrides["PLAYER_ID"].isin(out.index)]
+        if len(unmatched):
+            print(f"Preseason overrides not matched (skipped): {unmatched['PLAYER_NAME'].tolist()}")
+        for _, row in overrides.drop(unmatched.index).iterrows():
+            pid = int(row["PLAYER_ID"])
+            status = row["STATUS"]
+            out.at[pid, "PRESEASON_SOURCE"] = "override"
+            out.at[pid, "OUT_FOR_SEASON"] = status == "OFS"
+            out.at[pid, "INJURY_STATUS"] = None if status == "ACTIVE" else status
+            out.at[pid, "RETURN_DATE"] = None
+            out.at[pid, "GAMES_OUT_AHEAD"] = {
+                "ACTIVE": 0.0, "OFS": float(SEASON_GAMES)
+            }.get(status, float(min(row["GAMES_OUT"], SEASON_GAMES)))
+
+    out["GAMES_OUT_AHEAD"] = out["GAMES_OUT_AHEAD"].clip(upper=SEASON_GAMES)
+    late = out["INJURY_STATUS"].notna() & (
+        SEASON_GAMES - out["GAMES_OUT_AHEAD"] < OUT_FOR_SEASON_MIN_GAMES_LEFT
+    )
+    out["OUT_FOR_SEASON"] = out["OUT_FOR_SEASON"].astype(bool) | late
+    out.loc[out["OUT_FOR_SEASON"], "GAMES_OUT_AHEAD"] = float(SEASON_GAMES)
+    out.loc[out["OUT_FOR_SEASON"], "INJURY_STATUS"] = "OFS"
+    first_day = min((d[0] for d in team_dates if d), default=None)
+    out["AS_OF"] = first_day.isoformat() if first_day else "opening night"
+    return out.drop(columns="PLAYER_NAME").reset_index()
+
+
+def load_preseason_injury_games(roster: pd.DataFrame | None = None, today: date | None = None) -> pd.DataFrame:
+    from gamelogs import CURRENT_SEASON, load_gamelogs, season_end_year
+
+    roster = roster if roster is not None else pd.read_csv(ROSTERS_PATH)
+    current = load_injury_games(today, roster)
+    season_log = load_gamelogs([season_end_year(CURRENT_SEASON)])
+    return preseason_injury_games(roster, current, season_log, today=today)
+
+
 if __name__ == "__main__":
     fetch_espn_injuries()
     build_current_injuries(pd.read_csv(ROSTERS_PATH))

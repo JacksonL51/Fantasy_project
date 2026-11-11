@@ -207,6 +207,10 @@ USAGE_REDISTRIBUTION_MIN_MINUTES = 200.0  # both seasons of a training pair (tra
 #   "on" = apply when the injury files exist; "none" = pre-season projections.
 INJURY_ADJUSTMENT = "on"
 OUT_FOR_SEASON_PATH = PROCESSED_DIR / "out_for_season.csv"
+# Preseason view: the same model with injuries known heading into the season (hindsight from
+# game logs, injuries.preseason_injury_games), 82 games, no games-played data.
+PRESEASON_PROJECTIONS_PATH = PROCESSED_DIR / "projections_preseason.csv"
+OUT_FOR_SEASON_PRESEASON_PATH = PROCESSED_DIR / "out_for_season_preseason.csv"
 
 # Expected Games Played priors
 DEFAULT_STARTER_GP = 68.0
@@ -1514,12 +1518,15 @@ def project_rosters(
     current_ages: pd.Series | None = None,
     injury_games: pd.DataFrame | None = None,
     opportunity_model: dict | None = None,
-) -> pd.DataFrame:
+    injury_scenarios: dict[str, pd.DataFrame | None] | None = None,
+) -> pd.DataFrame | dict[str, pd.DataFrame]:
     """The whole projection for `roster` from `history` (seasons that may be used).
 
     Methods default to the module switches. The backtest passes past-only
     history, rebuilt rosters and `latest` (precomputed latest_season_rows).
-    `injury_games` (injuries.injury_games) turns on the injury step; None = pre-season.
+    `injury_games` (injuries.injury_games) turns on the injury step; None = no injuries.
+    `injury_scenarios` ({name: injury games or None}) runs the model once and returns one
+    projection per scenario (main uses "current" and "preseason").
     """
     rookie_method = rookie_method or ROOKIE_METHOD
     position_method = position_method or POSITION_ADJUSTMENT
@@ -1598,20 +1605,30 @@ def project_rosters(
     if (usage_scale != 1.0).any():
         print(f"Usage budget: shot-rate scale {usage_scale.min():.3f} to {usage_scale.max():.3f}")
     model_gp = proj_gp.copy()
-    injury_columns = None
-    if injury_games is not None:
-        mpg, season_min, proj_gp, rates, injury_columns = apply_injuries(
-            table, rates, mpg, proj_gp, injury_games, opportunity_model
+
+    def finish(scenario_games: pd.DataFrame | None, label: str = "") -> pd.DataFrame:
+        s_mpg, s_season_min, s_gp, s_rates, injury_columns = mpg, season_min, proj_gp, rates, None
+        if scenario_games is not None:
+            if label:
+                print(f"[{label}]", end=" ")
+            s_mpg, s_season_min, s_gp, s_rates, injury_columns = apply_injuries(
+                table, rates, mpg, proj_gp, scenario_games, opportunity_model
+            )
+        projections = synthesize_stats(
+            table, s_rates, active_mpg, s_gp, s_mpg, s_season_min, weight, mpg_blended
         )
-    projections = synthesize_stats(table, rates, active_mpg, proj_gp, mpg, season_min, weight, mpg_blended)
-    projections["USAGE_BUDGET_SCALE"] = usage_scale
-    projections["TEAM_VACATED_USAGE_REL"] = vacated
-    projections["TEAM_ARRIVED_USAGE_REL"] = arrived
-    if injury_columns is not None:
-        projections["MODEL_GP"] = model_gp
-        for column, values in injury_columns.items():
-            projections[column] = values
-    return projections
+        projections["USAGE_BUDGET_SCALE"] = usage_scale
+        projections["TEAM_VACATED_USAGE_REL"] = vacated
+        projections["TEAM_ARRIVED_USAGE_REL"] = arrived
+        if injury_columns is not None:
+            projections["MODEL_GP"] = model_gp
+            for column, values in injury_columns.items():
+                projections[column] = values
+        return projections
+
+    if injury_scenarios is not None:
+        return {name: finish(games, name) for name, games in injury_scenarios.items()}
+    return finish(injury_games)
 
 
 def apply_injuries(
@@ -1671,26 +1688,16 @@ def apply_injuries(
     return new_mpg, new_season_min, new_gp.rename("PROJECTED_GP"), rates, columns
 
 
-def main() -> None:
-    bundle = load_model_bundle()
-    roster = load_roster()
-    history = load_history()
-    if INJURY_ADJUSTMENT not in ("on", "none"):
-        raise ValueError(f"Unknown INJURY_ADJUSTMENT: {INJURY_ADJUSTMENT}")
-    injury_games = None
-    if INJURY_ADJUSTMENT == "on":
-        if Path(INJ.CURRENT_INJURIES_PATH).exists():
-            injury_games = INJ.load_injury_games(roster=roster)
-        else:
-            print(f"No {INJ.CURRENT_INJURIES_PATH}; run python src/injuries.py. Pre-season projections.")
-    projections = project_rosters(bundle, roster, history, injury_games=injury_games)
+def write_projections(
+    projections: pd.DataFrame, path: Path, out_path: Path, label: str
+) -> pd.DataFrame:
+    """Drop out-for-season players (listed in out_path), check and write one projection file."""
     if "OUT_FOR_SEASON" in projections.columns:
         out = projections["OUT_FOR_SEASON"].astype(bool)
-        projections[out][
-            ["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION", "INJURY_STATUS", "RETURN_DATE",
-             "GAMES_PLAYED_SO_FAR", "MODEL_GP"]
-        ].to_csv(OUT_FOR_SEASON_PATH, index=False)
-        print(f"Out for season ({int(out.sum())}, written to {OUT_FOR_SEASON_PATH}): "
+        keep = ["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION", "INJURY_STATUS", "RETURN_DATE",
+                "GAMES_PLAYED_SO_FAR", "MODEL_GP"]
+        projections.loc[out, [c for c in keep if c in projections.columns]].to_csv(out_path, index=False)
+        print(f"[{label}] out for season ({int(out.sum())}, written to {out_path}): "
               f"{', '.join(projections.loc[out, 'PLAYER_NAME'])}")
         projections = projections[~out].copy()
 
@@ -1699,9 +1706,7 @@ def main() -> None:
         ["TEAM_ABBREVIATION", "PROJECTED_MPG"], ascending=[True, False]
     )
     csv_projections = projections.copy()
-    csv_projections["PROJECTED_GP"] = csv_projections["PROJECTED_GP"].round().astype(
-        "int64"
-    )
+    csv_projections["PROJECTED_GP"] = csv_projections["PROJECTED_GP"].round().astype("int64")
     csv_projections[[f"PROJ_{stat}" for stat in OUTPUT_STATS]] = csv_projections[
         [f"PROJ_{stat}" for stat in OUTPUT_STATS]
     ].round(1)
@@ -1709,39 +1714,41 @@ def main() -> None:
         [f"TOTAL_{stat}" for stat in OUTPUT_STATS]
     ].round().astype("int64")
     percentage_columns = ["PROJ_FG_PCT", "PROJ_FT_PCT"]
-    csv_projections[percentage_columns] = (
-        csv_projections[percentage_columns].mul(100).round(1)
-    )
+    csv_projections[percentage_columns] = csv_projections[percentage_columns].mul(100).round(1)
     metadata_columns = [
-        "ROLE_TIER",
-        "WEIGHTED_SEASON_MINUTES",
-        "MINUTES_BASELINE",
-        "MINUTES_CREDIBILITY",
-        "COHORT_PRIOR_MINUTES",
-        "RAW_MPG",
-        "CREDIBILITY_WEIGHT",
-        "DATA_SEASON",
-        "NO_PRIOR_DATA",
-        "STALE_DATA",
-        "SHORT_SEASON_RETURN",
-        "MPG_BLENDED",
-        "ROOKIE_PRIOR",
-        "DRAFT_PICK",
-        "POSITION_CROWD",
-        "LAST_PTS_PG",
-        "USAGE_BUDGET_SCALE",
-        "TEAM_VACATED_USAGE_REL",
+        "ROLE_TIER", "WEIGHTED_SEASON_MINUTES", "MINUTES_BASELINE", "MINUTES_CREDIBILITY",
+        "COHORT_PRIOR_MINUTES", "RAW_MPG", "CREDIBILITY_WEIGHT", "DATA_SEASON", "NO_PRIOR_DATA",
+        "STALE_DATA", "SHORT_SEASON_RETURN", "MPG_BLENDED", "ROOKIE_PRIOR", "DRAFT_PICK",
+        "POSITION_CROWD", "LAST_PTS_PG", "USAGE_BUDGET_SCALE", "TEAM_VACATED_USAGE_REL",
         "TEAM_ARRIVED_USAGE_REL",
     ]
-    metadata_columns = [
-        column for column in metadata_columns if column in csv_projections.columns
-    ]
+    metadata_columns = [column for column in metadata_columns if column in csv_projections.columns]
     csv_projections = csv_projections[
         [column for column in csv_projections.columns if column not in metadata_columns]
         + metadata_columns
     ]
-    csv_projections.to_csv(PROJECTIONS_PATH, index=False)
-    print(f"\nWrote {len(projections)} rows to {PROJECTIONS_PATH}")
+    csv_projections.to_csv(path, index=False)
+    print(f"[{label}] wrote {len(projections)} rows to {path}")
+    return projections
+
+
+def main() -> None:
+    bundle = load_model_bundle()
+    roster = load_roster()
+    history = load_history()
+    if INJURY_ADJUSTMENT not in ("on", "none"):
+        raise ValueError(f"Unknown INJURY_ADJUSTMENT: {INJURY_ADJUSTMENT}")
+    scenarios: dict[str, pd.DataFrame | None] = {"current": None, "preseason": None}
+    if INJURY_ADJUSTMENT == "on":
+        if Path(INJ.CURRENT_INJURIES_PATH).exists():
+            current_games = INJ.load_injury_games(roster=roster)
+            scenarios["current"] = current_games
+            scenarios["preseason"] = INJ.load_preseason_injury_games(roster=roster)
+        else:
+            print(f"No {INJ.CURRENT_INJURIES_PATH}; run python src/injuries.py. No injuries applied.")
+    results = project_rosters(bundle, roster, history, injury_scenarios=scenarios)
+    write_projections(results["preseason"], PRESEASON_PROJECTIONS_PATH, OUT_FOR_SEASON_PRESEASON_PATH, "preseason")
+    projections = write_projections(results["current"], PROJECTIONS_PATH, OUT_FOR_SEASON_PATH, "current")
     print_review(projections)
 
 if __name__ == "__main__":
