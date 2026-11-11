@@ -154,6 +154,6 @@ def render() -> None:
     )
     st.caption(
         f"{explanation} The verdict and the better and worse lists use season totals, so they "
-        "count games played. Stats are full-season projections, so this doesn't adjust for "
-        "games already played or current injuries."
+        "count games played. Stats are full-season projections that include games already "
+        "played and known injury absences, so a hurt player's season total is lower."
     )

@@ -116,7 +116,24 @@ def plain_text(text: str) -> str:
     return "".join(c for c in decomposed if not unicodedata.combining(c)).casefold()
 
 
+def injury_note(row: pd.Series) -> str:
+    """'Out until Dec 21' / 'Day-to-day' from the injury columns; blank when healthy."""
+    status = row.get("INJURY_STATUS")
+    if pd.isna(status) or not status:
+        return ""
+    if status == "GTD":
+        return "Day-to-day"
+    back = pd.to_datetime(row.get("RETURN_DATE"), errors="coerce")
+    return f"Out until {back:%b} {back.day}" if pd.notna(back) else "Out, no timetable"
+
+
 def data_note(row: pd.Series) -> str:
+    injury = injury_note(row)
+    base = _history_note(row)
+    return " · ".join(note for note in (injury, base) if note)
+
+
+def _history_note(row: pd.Series) -> str:
     if row["NO_PRIOR_DATA"]:
         if row.get("ROOKIE_PRIOR", False) == True:  # noqa: E712 (numpy bools)
             pick = row.get("DRAFT_PICK")
@@ -148,6 +165,21 @@ def require_players() -> tuple[pd.DataFrame, datetime]:
         st.stop()
     modified = PROJECTIONS_PATH.stat().st_mtime
     return load_players(str(PROJECTIONS_PATH), modified), datetime.fromtimestamp(modified)
+
+
+OUT_FOR_SEASON_PATH = PROJECTIONS_PATH.parent / "out_for_season.csv"
+
+
+@st.cache_data
+def _out_for_season(modified: float) -> pd.DataFrame:
+    return pd.read_csv(OUT_FOR_SEASON_PATH)
+
+
+def out_for_season() -> pd.DataFrame:
+    """Players project.py dropped as out for the season (empty if none or no file)."""
+    if not OUT_FOR_SEASON_PATH.exists():
+        return pd.DataFrame(columns=["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION"])
+    return _out_for_season(OUT_FOR_SEASON_PATH.stat().st_mtime)
 
 
 DATA_DIR = PROJECTIONS_PATH.parent.parent
