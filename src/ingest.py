@@ -540,4 +540,11 @@ if __name__ == "__main__":
     fetch_draft_history()
     fetch_rookie_ages(roster_df)
     fetch_player_positions()
+    from gamelogs import fetch_all_gamelogs, fetch_schedule
+    from injuries import build_current_injuries, fetch_espn_injuries
+
+    fetch_all_gamelogs()  # past seasons cached; only the current season is re-fetched
+    fetch_schedule()
+    fetch_espn_injuries()
+    build_current_injuries(roster_df)
     print("Data ingestion complete.")

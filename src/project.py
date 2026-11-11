@@ -66,6 +66,11 @@ from model import (
     predict_rates,
 )
 import rookies as R
+import injuries as INJ
+import opportunity as OPP
+import inseason as IS
+from pathlib import Path
+from datetime import date
 
 PROJECT_ROOT = PROCESSED_DIR.parents[1]
 ROSTERS_PATH = PROJECT_ROOT / "data" / "raw" / "current_rosters.csv"
@@ -192,6 +197,27 @@ USAGE_REDISTRIBUTION_STATS = ["PTS", "FGA", "FTA", "AST", "TOV"]
 USAGE_REDISTRIBUTION_METHODS = {"tov": ["TOV"], "fitted": USAGE_REDISTRIBUTION_STATS, "none": []}
 USAGE_REDISTRIBUTION_FOLLOW = {"FGM": "FGA", "FTM": "FTA"}
 USAGE_REDISTRIBUTION_MIN_MINUTES = 200.0  # both seasons of a training pair (training_pairs rule)
+# INJURY_ADJUSTMENT (Injuries branch): current injuries and games already played.
+# Projections stay full-season with pre-season rates. After the minutes and usage budgets:
+#   GP = games played so far + (model GP / 82) x (team games left - known games out),
+#   where known games out come from data/processed/current_injuries.csv (ESPN + manual
+#   overrides) and the schedule (injuries.injury_games). Players out for the season (ESPN
+#   OFS, or a return leaving < 10 team games) are dropped from projections_by_team.csv and
+#   written to out_for_season.csv. Teammates gain MPG and PTS/FGA/FTA/AST rates from each
+#   regular's change in expected games (opportunity.apply_opportunity, fitted from game
+#   logs 2014-26). Backtests never pass injuries, so they are unchanged.
+#   "on" = apply when the injury files exist; "none" = pre-season projections.
+INJURY_ADJUSTMENT = "on"
+OUT_FOR_SEASON_PATH = PROCESSED_DIR / "out_for_season.csv"
+# INSEASON_UPDATE: "on" = the current view is up to date: actual stats for games played
+# plus a projection of the remaining games that blends the preseason projection with
+# this season's minutes and rates (inseason.py, backtested in analysis/inseason_*.py).
+# "none" = current view keeps preseason per-game rates and minutes.
+INSEASON_UPDATE = "on"
+# Preseason view: the same model with injuries known heading into the season (hindsight from
+# game logs, injuries.preseason_injury_games), 82 games, no games-played data.
+PRESEASON_PROJECTIONS_PATH = PROCESSED_DIR / "projections_preseason.csv"
+OUT_FOR_SEASON_PRESEASON_PATH = PROCESSED_DIR / "out_for_season_preseason.csv"
 
 # Expected Games Played priors
 DEFAULT_STARTER_GP = 68.0
@@ -1497,11 +1523,20 @@ def project_rosters(
     usage_redistribution: str | None = None,
     draft: pd.DataFrame | None = None,
     current_ages: pd.Series | None = None,
-) -> pd.DataFrame:
+    injury_games: pd.DataFrame | None = None,
+    opportunity_model: dict | None = None,
+    injury_scenarios: dict[str, pd.DataFrame | None] | None = None,
+    inseason_observed: dict[str, pd.DataFrame] | None = None,
+) -> pd.DataFrame | dict[str, pd.DataFrame]:
     """The whole projection for `roster` from `history` (seasons that may be used).
 
     Methods default to the module switches. The backtest passes past-only
     history, rebuilt rosters and `latest` (precomputed latest_season_rows).
+    `injury_games` (injuries.injury_games) turns on the injury step; None = no injuries.
+    `injury_scenarios` ({name: injury games or None}) runs the model once and returns one
+    projection per scenario (main uses "current" and "preseason").
+    `inseason_observed` ({scenario name: inseason.observed_stats}) makes that scenario the
+    up-to-date view: actual games so far + blended projection of the remaining games.
     """
     rookie_method = rookie_method or ROOKIE_METHOD
     position_method = position_method or POSITION_ADJUSTMENT
@@ -1579,27 +1614,149 @@ def project_rosters(
     rates, usage_scale = apply_usage_budget(table, rates, season_min, usage_budget or USAGE_BUDGET)
     if (usage_scale != 1.0).any():
         print(f"Usage budget: shot-rate scale {usage_scale.min():.3f} to {usage_scale.max():.3f}")
-    projections = synthesize_stats(table, rates, active_mpg, proj_gp, mpg, season_min, weight, mpg_blended)
-    projections["USAGE_BUDGET_SCALE"] = usage_scale
-    projections["TEAM_VACATED_USAGE_REL"] = vacated
-    projections["TEAM_ARRIVED_USAGE_REL"] = arrived
-    return projections
+    model_gp = proj_gp.copy()
+
+    def finish(scenario_games: pd.DataFrame | None, label: str = "") -> pd.DataFrame:
+        s_mpg, s_season_min, s_gp, s_rates, injury_columns = mpg, season_min, proj_gp, rates, None
+        observed = (inseason_observed or {}).get(label)
+        if scenario_games is not None:
+            if label:
+                print(f"[{label}]", end=" ")
+            s_mpg, s_season_min, s_gp, s_rates, injury_columns = apply_injuries(
+                table, rates, mpg, proj_gp, scenario_games, opportunity_model, observed
+            )
+        projections = synthesize_stats(
+            table, s_rates, active_mpg, s_gp, s_mpg, s_season_min, weight, mpg_blended
+        )
+        if observed is not None and scenario_games is not None:
+            # Up-to-date view: the synthesized lines cover the remaining games only.
+            projections = IS.combine_with_actual(projections, observed, observed.attrs.get("as_of"))
+        projections["USAGE_BUDGET_SCALE"] = usage_scale
+        projections["TEAM_VACATED_USAGE_REL"] = vacated
+        projections["TEAM_ARRIVED_USAGE_REL"] = arrived
+        if injury_columns is not None:
+            projections["MODEL_GP"] = model_gp
+            for column, values in injury_columns.items():
+                projections[column] = values
+        return projections
+
+    if injury_scenarios is not None:
+        return {name: finish(games, name) for name, games in injury_scenarios.items()}
+    return finish(injury_games)
 
 
-def main() -> None:
-    bundle = load_model_bundle()
-    roster = load_roster()
-    history = load_history()
-    projections = project_rosters(bundle, roster, history)
+def apply_injuries(
+    table: pd.DataFrame,
+    rates: pd.DataFrame,
+    mpg: pd.Series,
+    proj_gp: pd.Series,
+    injury_games: pd.DataFrame,
+    opportunity_model: dict | None = None,
+    observed: pd.DataFrame | None = None,
+) -> tuple[pd.Series, pd.Series, pd.Series, pd.DataFrame, dict[str, pd.Series]]:
+    """Injury-adjusted games, then teammates' extra minutes and rates (INJURY_ADJUSTMENT).
+
+    With `observed` (inseason.observed_stats), returns the REMAINING games only: games =
+    availability x (team games left - known games out); teammate opportunity uses each
+    player's share of the remaining games he will miss and lifts the preseason part, which
+    is then blended with observed minutes and rates (inseason.py). combine_with_actual adds
+    the games already played.
+    """
+    games = (
+        injury_games.drop_duplicates("PLAYER_ID")
+        .set_index("PLAYER_ID")
+        .reindex(table["PLAYER_ID"].to_numpy())
+    )
+    games.index = table.index
+    team_left = (
+        injury_games.drop_duplicates("TEAM_ABBREVIATION")
+        .set_index("TEAM_ABBREVIATION")["TEAM_GAMES_LEFT"]
+    )
+    games["TEAM_GAMES_LEFT"] = games["TEAM_GAMES_LEFT"].fillna(
+        table["TEAM_ABBREVIATION"].map(team_left)
+    ).fillna(INJ.SEASON_GAMES)
+    games["GAMES_PLAYED"] = games["GAMES_PLAYED"].fillna(0)
+    games["GAMES_OUT_AHEAD"] = games["GAMES_OUT_AHEAD"].fillna(0.0)
+    games["OUT_FOR_SEASON"] = games["OUT_FOR_SEASON"].fillna(False).astype(bool)
+    new_gp = INJ.adjusted_games(proj_gp, games)
+
+    model = opportunity_model if opportunity_model is not None else OPP.load_opportunity_model()
+    if not model.get("active", False):
+        print(f"Injury opportunity off: {model.get('reason', 'inactive model')}")
+    frame = pd.DataFrame(
+        {
+            "PLAYER_ID": table["PLAYER_ID"],
+            "TEAM_ABBREVIATION": table["TEAM_ABBREVIATION"],
+            "PROJECTED_MPG": mpg,
+        }
+    )
+    out = games["OUT_FOR_SEASON"]
+    extra_columns = {}
+    if observed is None:
+        gain, rates = OPP.apply_opportunity(frame, rates, proj_gp, new_gp, model)
+        new_mpg = (mpg + gain).clip(lower=0.5, upper=MAX_HEALTHY_MPG + 3).rename("PROJECTED_MPG")
+        new_season_min = (new_mpg * new_gp).rename("PROJECTED_SEASON_MIN")
+    else:
+        availability = (proj_gp / INJ.SEASON_GAMES).clip(0.0, 1.0)
+        left = games["TEAM_GAMES_LEFT"]
+        ahead = games["GAMES_OUT_AHEAD"].clip(upper=left)
+        ros_gp = (availability * (left - ahead)).clip(lower=0.0)
+        absent_share = (availability * ahead / left.where(left > 0)).fillna(0.0)
+        gain, rates = OPP.apply_opportunity(
+            frame, rates, proj_gp, new_gp, model, absent_share=absent_share
+        )
+        prior_mpg = (mpg + gain).clip(lower=0.5, upper=MAX_HEALTHY_MPG + 3)
+        ids = table["PLAYER_ID"].to_numpy()
+        ros_mpg, obs_weight = IS.blend_minutes(pd.Series(prior_mpg.to_numpy(), index=ids), observed)
+        stats = [s for s in IS.TOTAL_STATS if s in rates.columns]
+        blended = IS.blend_rates(pd.DataFrame(rates[stats].to_numpy(), index=ids, columns=stats), observed)
+        rates = rates.copy()
+        rates[stats] = blended.to_numpy()
+        new_mpg = pd.Series(ros_mpg.to_numpy(), index=table.index, name="PROJECTED_MPG")
+        new_gp = ros_gp
+        new_season_min = (new_mpg * new_gp).rename("PROJECTED_SEASON_MIN")
+        extra_columns["MINUTES_OBS_WEIGHT"] = pd.Series(obs_weight.to_numpy(), index=table.index).round(3)
+        extra_columns["PRESEASON_MPG"] = mpg.round(1)
+    print(
+        f"Injuries: {int(games['INJURY_STATUS'].notna().sum())} listed, {int(out.sum())} out for "
+        + (
+            f"season; GP change {float((new_gp - proj_gp).sum()):+,.0f} games league-wide; "
+            if observed is None
+            else f"season; {float(new_gp.sum()):,.0f} player-games still to play; "
+        )
+        + f"teammate MPG gain up to {float(gain.max()):+.2f}"
+    )
+    columns = {
+        "GAMES_PLAYED_SO_FAR": games["GAMES_PLAYED"].astype(int),
+        "GAMES_OUT_AHEAD": games["GAMES_OUT_AHEAD"],
+        "INJURY_STATUS": games["INJURY_STATUS"],
+        "RETURN_DATE": games["RETURN_DATE"],
+        "OUT_FOR_SEASON": out,
+        "INJURY_MPG_GAIN": gain.round(2),
+        **extra_columns,
+    }
+    return new_mpg, new_season_min, new_gp.rename("PROJECTED_GP"), rates, columns
+
+
+def write_projections(
+    projections: pd.DataFrame, path: Path, out_path: Path, label: str
+) -> pd.DataFrame:
+    """Drop out-for-season players (listed in out_path), check and write one projection file."""
+    if "OUT_FOR_SEASON" in projections.columns:
+        out = projections["OUT_FOR_SEASON"].astype(bool)
+        keep = ["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION", "INJURY_STATUS", "RETURN_DATE",
+                "GAMES_PLAYED_SO_FAR", "MODEL_GP"]
+        projections.loc[out, [c for c in keep if c in projections.columns]].to_csv(out_path, index=False)
+        print(f"[{label}] out for season ({int(out.sum())}, written to {out_path}): "
+              f"{', '.join(projections.loc[out, 'PLAYER_NAME'])}")
+        projections = projections[~out].copy()
 
     validate_projections(projections)
     projections = projections.sort_values(
         ["TEAM_ABBREVIATION", "PROJECTED_MPG"], ascending=[True, False]
     )
     csv_projections = projections.copy()
-    csv_projections["PROJECTED_GP"] = csv_projections["PROJECTED_GP"].round().astype(
-        "int64"
-    )
+    csv_projections["PROJECTED_GP"] = csv_projections["PROJECTED_GP"].round().astype("int64")
     csv_projections[[f"PROJ_{stat}" for stat in OUTPUT_STATS]] = csv_projections[
         [f"PROJ_{stat}" for stat in OUTPUT_STATS]
     ].round(1)
@@ -1607,39 +1764,55 @@ def main() -> None:
         [f"TOTAL_{stat}" for stat in OUTPUT_STATS]
     ].round().astype("int64")
     percentage_columns = ["PROJ_FG_PCT", "PROJ_FT_PCT"]
-    csv_projections[percentage_columns] = (
-        csv_projections[percentage_columns].mul(100).round(1)
-    )
+    csv_projections[percentage_columns] = csv_projections[percentage_columns].mul(100).round(1)
     metadata_columns = [
-        "ROLE_TIER",
-        "WEIGHTED_SEASON_MINUTES",
-        "MINUTES_BASELINE",
-        "MINUTES_CREDIBILITY",
-        "COHORT_PRIOR_MINUTES",
-        "RAW_MPG",
-        "CREDIBILITY_WEIGHT",
-        "DATA_SEASON",
-        "NO_PRIOR_DATA",
-        "STALE_DATA",
-        "SHORT_SEASON_RETURN",
-        "MPG_BLENDED",
-        "ROOKIE_PRIOR",
-        "DRAFT_PICK",
-        "POSITION_CROWD",
-        "LAST_PTS_PG",
-        "USAGE_BUDGET_SCALE",
-        "TEAM_VACATED_USAGE_REL",
+        "ROLE_TIER", "WEIGHTED_SEASON_MINUTES", "MINUTES_BASELINE", "MINUTES_CREDIBILITY",
+        "COHORT_PRIOR_MINUTES", "RAW_MPG", "CREDIBILITY_WEIGHT", "DATA_SEASON", "NO_PRIOR_DATA",
+        "STALE_DATA", "SHORT_SEASON_RETURN", "MPG_BLENDED", "ROOKIE_PRIOR", "DRAFT_PICK",
+        "POSITION_CROWD", "LAST_PTS_PG", "USAGE_BUDGET_SCALE", "TEAM_VACATED_USAGE_REL",
         "TEAM_ARRIVED_USAGE_REL",
     ]
-    metadata_columns = [
-        column for column in metadata_columns if column in csv_projections.columns
-    ]
+    metadata_columns = [column for column in metadata_columns if column in csv_projections.columns]
     csv_projections = csv_projections[
         [column for column in csv_projections.columns if column not in metadata_columns]
         + metadata_columns
     ]
-    csv_projections.to_csv(PROJECTIONS_PATH, index=False)
-    print(f"\nWrote {len(projections)} rows to {PROJECTIONS_PATH}")
+    csv_projections.to_csv(path, index=False)
+    print(f"[{label}] wrote {len(projections)} rows to {path}")
+    return projections
+
+
+def main() -> None:
+    bundle = load_model_bundle()
+    roster = load_roster()
+    history = load_history()
+    if INJURY_ADJUSTMENT not in ("on", "none"):
+        raise ValueError(f"Unknown INJURY_ADJUSTMENT: {INJURY_ADJUSTMENT}")
+    scenarios: dict[str, pd.DataFrame | None] = {"current": None, "preseason": None}
+    if INJURY_ADJUSTMENT == "on":
+        if Path(INJ.CURRENT_INJURIES_PATH).exists():
+            current_games = INJ.load_injury_games(roster=roster)
+            scenarios["current"] = current_games
+            scenarios["preseason"] = INJ.load_preseason_injury_games(roster=roster)
+        else:
+            print(f"No {INJ.CURRENT_INJURIES_PATH}; run python src/injuries.py. No injuries applied.")
+    observed = {}
+    if INSEASON_UPDATE == "on" and scenarios["current"] is not None:
+        from gamelogs import CURRENT_SEASON, load_gamelogs, season_end_year
+
+        current = IS.observed_stats(load_gamelogs([season_end_year(CURRENT_SEASON)]), date.today())
+        if len(current):
+            observed["current"] = current
+            print(f"Up-to-date view: {len(current)} players with games, as of {current.attrs['as_of']}")
+    results = project_rosters(
+        bundle, roster, history, injury_scenarios=scenarios, inseason_observed=observed
+    )
+    if "AS_OF" not in results["preseason"].columns:
+        results["preseason"]["AS_OF"] = (
+            str(scenarios["preseason"]["AS_OF"].iloc[0]) if scenarios["preseason"] is not None else ""
+        )
+    write_projections(results["preseason"], PRESEASON_PROJECTIONS_PATH, OUT_FOR_SEASON_PRESEASON_PATH, "preseason")
+    projections = write_projections(results["current"], PROJECTIONS_PATH, OUT_FOR_SEASON_PATH, "current")
     print_review(projections)
 
 if __name__ == "__main__":

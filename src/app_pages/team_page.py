@@ -8,10 +8,12 @@ from app_shared import (
     PER_GAME,
     SEASON_TOTALS,
     category_table_html,
+    out_for_season,
     player_label,
     player_row,
     player_search,
     require_players,
+    show_as_of,
     table_html,
     team_choice_label,
     team_choices,
@@ -199,6 +201,7 @@ def team_controls(league: League, team: Team) -> None:
 def render() -> None:
     st.title("My Team")
     players, _ = require_players()
+    show_as_of(players)
     league = load_league()
     if league.problem:
         st.warning(league.problem)
@@ -211,7 +214,17 @@ def render() -> None:
 
     known = set(players["PLAYER_ID"])
     roster = [player for player in team.roster if player in known]
-    missing = len(team.roster) - len(roster)
+    gone = [player for player in team.roster if player not in known]
+    season_over = out_for_season()
+    out_names = season_over.set_index("PLAYER_ID")["PLAYER_NAME"]
+    injured_out = [player for player in gone if player in out_names.index]
+    if injured_out:
+        names = ", ".join(f"{out_names[player]} (out for season)" for player in injured_out)
+        st.warning(
+            f"{names}: no projected games left, so not counted here. Your saved team still "
+            "lists them; remove them to free the roster spot."
+        )
+    missing = len(gone) - len(injured_out)
     if missing:
         st.warning(
             f"{missing} saved player(s) are no longer in the projections, so they aren't "
@@ -271,5 +284,7 @@ def render() -> None:
             "including for turnovers. It isn't a comparison with other fantasy teams.\n"
             "- **Strongest and weakest categories:** ranked against each other within your "
             "team.\n"
-            "- **Stats:** projections cover a full season and don't know about current injuries."
+            "- **Stats:** the whole season: games already played as they happened, plus the "
+            "remaining games projected from preseason and this season's minutes and stats, "
+            "minus known injury absences. Teammates get injured players' minutes."
         )

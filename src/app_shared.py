@@ -18,6 +18,13 @@ PROJECTIONS_PATH = (
     / "processed"
     / "projections_by_team.csv"
 )
+PRESEASON_PROJECTIONS_PATH = PROJECTIONS_PATH.parent / "projections_preseason.csv"
+CURRENT = "Current"
+PRESEASON = "Preseason"
+PROJECTION_VIEW_KEY = "projection_view"
+# Widget state is dropped when a page without the widget runs, so the chosen view is also
+# kept under its own key to carry it between Rankings and Rookies.
+PROJECTION_VIEW_SAVED_KEY = "projection_view_saved"
 
 STAT_LABELS = {
     "PTS": "PTS",
@@ -116,7 +123,28 @@ def plain_text(text: str) -> str:
     return "".join(c for c in decomposed if not unicodedata.combining(c)).casefold()
 
 
-def data_note(row: pd.Series) -> str:
+def injury_note(row: pd.Series, view: str = "Current") -> str:
+    """'Out until Dec 21' / 'Day-to-day' from the injury columns; blank when healthy.
+    In the preseason view: 'Out first 11 games'."""
+    status = row.get("INJURY_STATUS")
+    if pd.isna(status) or not status:
+        return ""
+    if view == PRESEASON:
+        games = row.get("GAMES_OUT_AHEAD")
+        return f"Out first {int(round(games))} games" if pd.notna(games) else "Injured"
+    if status == "GTD":
+        return "Day-to-day"
+    back = pd.to_datetime(row.get("RETURN_DATE"), errors="coerce")
+    return f"Out until {back:%b} {back.day}" if pd.notna(back) else "Out, no timetable"
+
+
+def data_note(row: pd.Series, view: str = "Current") -> str:
+    injury = injury_note(row, view)
+    base = _history_note(row)
+    return " · ".join(note for note in (injury, base) if note)
+
+
+def _history_note(row: pd.Series) -> str:
     if row["NO_PRIOR_DATA"]:
         if row.get("ROOKIE_PRIOR", False) == True:  # noqa: E712 (numpy bools)
             pick = row.get("DRAFT_PICK")
@@ -128,26 +156,80 @@ def data_note(row: pd.Series) -> str:
 
 
 @st.cache_data
-def load_players(path: str, modified: float) -> pd.DataFrame:
+def load_players(path: str, modified: float, view: str = "Current") -> pd.DataFrame:
     """Load projections with ranks, best first. `modified` refreshes the cache on file change."""
     projections = pd.read_csv(path)
     rankings = rank_players(projections).drop(columns=["PLAYER_NAME", "TEAM_ABBREVIATION"])
     frame = rankings.merge(projections, on="PLAYER_ID", how="left", validate="one_to_one")
-    frame["NOTE"] = frame.apply(data_note, axis=1)
+    frame["NOTE"] = frame.apply(data_note, axis=1, view=view)
     frame["SEARCH_NAME"] = frame["PLAYER_NAME"].map(plain_text)
     return frame
 
 
-def require_players() -> tuple[pd.DataFrame, datetime]:
-    """The ranked players and when projections were made. Stops the page if there are none."""
-    if not PROJECTIONS_PATH.exists():
-        st.error(
-            f"No projections found at {PROJECTIONS_PATH}. "
-            "Run `python src/project.py` first."
-        )
+def require_players(view: str = CURRENT) -> tuple[pd.DataFrame, datetime]:
+    """The ranked players and when projections were made. Stops the page if there are none.
+
+    `view` is CURRENT (projections_by_team.csv) or PRESEASON (projections_preseason.csv).
+    """
+    path = PRESEASON_PROJECTIONS_PATH if view == PRESEASON else PROJECTIONS_PATH
+    if not path.exists():
+        st.error(f"No projections found at {path}. Run `python src/project.py` first.")
         st.stop()
-    modified = PROJECTIONS_PATH.stat().st_mtime
-    return load_players(str(PROJECTIONS_PATH), modified), datetime.fromtimestamp(modified)
+    modified = path.stat().st_mtime
+    return load_players(str(path), modified, view), datetime.fromtimestamp(modified)
+
+
+def as_of_text(players: pd.DataFrame, view: str = CURRENT) -> str:
+    """'As of Nov 10, 2026' from the projections' AS_OF column (latest game included)."""
+    stamp = players["AS_OF"].dropna().astype(str) if "AS_OF" in players.columns else pd.Series(dtype=str)
+    stamp = stamp[stamp != ""]
+    when = pd.to_datetime(stamp.iloc[0], errors="coerce") if len(stamp) else pd.NaT
+    if pd.isna(when):
+        return ""
+    day = f"{when:%b} {when.day}, {when:%Y}"
+    return f"Preseason · opening night {day}" if view == PRESEASON else f"As of {day}"
+
+
+def show_as_of(players: pd.DataFrame, view: str = CURRENT) -> None:
+    """The date line under a page title."""
+    text = as_of_text(players, view)
+    if text:
+        st.markdown(f"**{text}**")
+
+
+def projection_view_control(column=None) -> str:
+    """Current / Preseason switch, shared by the Rankings and Rookies pages."""
+    if not PRESEASON_PROJECTIONS_PATH.exists():
+        return CURRENT
+    host = column if column is not None else st
+    saved = st.session_state.get(PROJECTION_VIEW_SAVED_KEY, CURRENT)
+    choice = host.segmented_control(
+        "Projections", [CURRENT, PRESEASON], default=saved, required=True,
+        key=PROJECTION_VIEW_KEY,
+        help=(
+            "Current: games played so far count, plus today's injuries (ESPN and your "
+            "overrides). Preseason: an 82-game season with injuries known heading into it "
+            "(from who missed their team's opening games, so it uses hindsight)."
+        ),
+    )
+    choice = choice or CURRENT
+    st.session_state[PROJECTION_VIEW_SAVED_KEY] = choice
+    return choice
+
+
+OUT_FOR_SEASON_PATH = PROJECTIONS_PATH.parent / "out_for_season.csv"
+
+
+@st.cache_data
+def _out_for_season(modified: float) -> pd.DataFrame:
+    return pd.read_csv(OUT_FOR_SEASON_PATH)
+
+
+def out_for_season() -> pd.DataFrame:
+    """Players project.py dropped as out for the season (empty if none or no file)."""
+    if not OUT_FOR_SEASON_PATH.exists():
+        return pd.DataFrame(columns=["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION"])
+    return _out_for_season(OUT_FOR_SEASON_PATH.stat().st_mtime)
 
 
 DATA_DIR = PROJECTIONS_PATH.parent.parent

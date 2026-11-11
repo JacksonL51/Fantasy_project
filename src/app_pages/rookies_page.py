@@ -15,7 +15,9 @@ from app_shared import (
     SEASON_TOTALS,
     height_text,
     is_rookie,
+    projection_view_control,
     require_players,
+    show_as_of,
     rookie_details,
     table_html,
 )
@@ -64,7 +66,7 @@ def detail_table(shown: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.fragment
-def rookie_tables(rookies: pd.DataFrame, show_colors: bool) -> None:
+def rookie_tables(rookies: pd.DataFrame, show_colors: bool, projection_view: str = "") -> None:
     search_col, team_col, draft_col, view_col = st.columns([4, 3, 3, 3])
     search = search_col.text_input("Search rookie", type="search", placeholder="Player name", live=True)
     teams = team_col.multiselect(
@@ -92,7 +94,7 @@ def rookie_tables(rookies: pd.DataFrame, show_colors: bool) -> None:
                 shown, view, sort_key, descending,
                 fixed_height=True, show_colors=show_colors, sortable=True,
             ),
-            "rows_key": f"{search}|{teams}|{draft_filter}|{view}|{sort_key}|{descending}",
+            "rows_key": f"{projection_view}|{search}|{teams}|{draft_filter}|{view}|{sort_key}|{descending}",
         },
         on_sort_change=on_header_click,
     )
@@ -117,22 +119,24 @@ def rookie_tables(rookies: pd.DataFrame, show_colors: bool) -> None:
 
 def render() -> None:
     st.title("Rookies")
-    players, modified = require_players()
+    projection_view = projection_view_control()
+    players, modified = require_players(projection_view)
+    show_as_of(players, projection_view)
     rookies = players[is_rookie(players)]
     if rookies.empty:
-        st.info("No rookies in the current projections.")
+        st.info("No rookies in these projections.")
         return
     drafted = int(rookies["DRAFT_PICK"].notna().sum())
     st.caption(
         f"{len(rookies)} rostered rookies ({drafted} drafted, {len(rookies) - drafted} undrafted) · "
-        f"Projections updated {modified:%b %d, %Y}"
+        f"{projection_view} projections, updated {modified:%b %d, %Y}"
     )
 
     toggle_col, legend_col = st.columns([1, 4], vertical_alignment="center")
     show_colors = toggle_col.toggle("Category colors", value=True, key="rookie_colors")
     if show_colors:
         legend_col.html(TINT_LEGEND)
-    rookie_tables(rookies, show_colors)
+    rookie_tables(rookies, show_colors, projection_view)
 
     with st.expander("How rookie projections are made"):
         st.markdown(
