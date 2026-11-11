@@ -11,6 +11,7 @@ from app_shared import (
     plain_text,
     projection_view_control,
     require_players,
+    show_as_of,
     stat_prefix,
     table_html,
 )
@@ -144,10 +145,11 @@ def render() -> None:
     st.title("NBA Fantasy Projections")
     projection_view = projection_view_control()
     players, modified = require_players(projection_view)
+    show_as_of(players, projection_view)
     detail = (
         "82-game season with injuries known heading into it"
         if projection_view == PRESEASON
-        else "games played so far and today's injuries"
+        else "actual games so far plus a projection of the rest"
     )
     st.caption(
         f"{len(players)} rostered players · {projection_view}: {detail} · "
@@ -177,10 +179,14 @@ def render() -> None:
             "opportunity; see the Rookies page.\n"
             "- **No recent NBA seasons:** players back after years away get replacement-level "
             "stats.\n"
-            "- **Current vs Preseason:** both use the same per-game model. Current counts games "
-            "already played and today's injuries; Preseason is a full 82 games minus injuries "
-            "known heading into the season, found from who missed their team's opening games "
-            "(so it uses hindsight, and a player who wasn't in the rotation can look injured). "
+            "- **Current:** the whole season. Games already played count as they happened; the "
+            "remaining games blend the preseason projection with this season's minutes "
+            "(weighted strongly: about half after 10 games) and per-minute stats (weighted by "
+            "stat: shot attempts and assists move fastest, steals and blocks slowest), minus "
+            "known injury absences. Per-game numbers are whole-season averages.\n"
+            "- **Preseason:** a full 82 games minus injuries known heading into the season, "
+            "found from who missed their team's opening games (so it uses hindsight, and a "
+            "player who wasn't in the rotation can look injured). "
             "Correct those in data/raw/injury_overrides_preseason.csv. Players out for the "
             "season are left out of both. Teammates of injured players get the extra minutes."
         )

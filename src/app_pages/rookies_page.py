@@ -17,6 +17,7 @@ from app_shared import (
     is_rookie,
     projection_view_control,
     require_players,
+    show_as_of,
     rookie_details,
     table_html,
 )
@@ -120,6 +121,7 @@ def render() -> None:
     st.title("Rookies")
     projection_view = projection_view_control()
     players, modified = require_players(projection_view)
+    show_as_of(players, projection_view)
     rookies = players[is_rookie(players)]
     if rookies.empty:
         st.info("No rookies in these projections.")

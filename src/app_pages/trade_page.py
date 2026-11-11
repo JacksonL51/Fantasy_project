@@ -11,6 +11,7 @@ from app_shared import (
     player_row,
     player_search,
     require_players,
+    show_as_of,
     team_choice_label,
     team_choices,
     trade_table_html,
@@ -50,6 +51,7 @@ def choose_team() -> None:
 def render() -> None:
     st.title("Trade Analyzer")
     players, _ = require_players()
+    show_as_of(players)
     league = load_league()
     if league.problem:
         st.warning(league.problem)

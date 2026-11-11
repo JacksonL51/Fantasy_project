@@ -220,11 +220,15 @@ def apply_opportunity(
     new_gp: pd.Series,
     model: dict,
     positions: pd.Series | None = None,
+    absent_share: pd.Series | None = None,
 ) -> tuple[pd.Series, pd.DataFrame]:
     """MPG gain per player and rates after teammates' expected absences change.
 
     `projections` needs PLAYER_ID, TEAM_ABBREVIATION, PROJECTED_MPG (before this change);
     rates are per minute, same index. Returns (MPG change, new rates).
+    `absent_share` (optional): each player's extra share of the games in question he will
+    miss, used instead of (old_gp - new_gp) / 82 (the up-to-date view passes the share of
+    the remaining games).
     """
     mpg_gain = pd.Series(0.0, index=projections.index)
     rates = rates.copy()
@@ -241,7 +245,8 @@ def apply_opportunity(
         ),
         index=mpg.index,
     )
-    delta = ((old_gp - new_gp) * weight).fillna(0.0)
+    raw_delta = old_gp - new_gp if absent_share is None else absent_share * SEASON_GAMES
+    delta = (raw_delta * weight).fillna(0.0)
     volume = (rates["FGA"] + 0.44 * rates["FTA"] + rates["TOV"]) * mpg
     bands = pd.cut(mpg, model["band_edges"], labels=False, include_lowest=True)
     coef = bands.map(model["band_coef"]).fillna(0.0)

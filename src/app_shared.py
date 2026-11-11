@@ -179,6 +179,24 @@ def require_players(view: str = CURRENT) -> tuple[pd.DataFrame, datetime]:
     return load_players(str(path), modified, view), datetime.fromtimestamp(modified)
 
 
+def as_of_text(players: pd.DataFrame, view: str = CURRENT) -> str:
+    """'As of Nov 10, 2026' from the projections' AS_OF column (latest game included)."""
+    stamp = players["AS_OF"].dropna().astype(str) if "AS_OF" in players.columns else pd.Series(dtype=str)
+    stamp = stamp[stamp != ""]
+    when = pd.to_datetime(stamp.iloc[0], errors="coerce") if len(stamp) else pd.NaT
+    if pd.isna(when):
+        return ""
+    day = f"{when:%b} {when.day}, {when:%Y}"
+    return f"Preseason · opening night {day}" if view == PRESEASON else f"As of {day}"
+
+
+def show_as_of(players: pd.DataFrame, view: str = CURRENT) -> None:
+    """The date line under a page title."""
+    text = as_of_text(players, view)
+    if text:
+        st.markdown(f"**{text}**")
+
+
 def projection_view_control(column=None) -> str:
     """Current / Preseason switch, shared by the Rankings and Rookies pages."""
     if not PRESEASON_PROJECTIONS_PATH.exists():

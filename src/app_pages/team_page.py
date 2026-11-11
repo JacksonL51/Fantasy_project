@@ -13,6 +13,7 @@ from app_shared import (
     player_row,
     player_search,
     require_players,
+    show_as_of,
     table_html,
     team_choice_label,
     team_choices,
@@ -200,6 +201,7 @@ def team_controls(league: League, team: Team) -> None:
 def render() -> None:
     st.title("My Team")
     players, _ = require_players()
+    show_as_of(players)
     league = load_league()
     if league.problem:
         st.warning(league.problem)
@@ -282,7 +284,7 @@ def render() -> None:
             "including for turnovers. It isn't a comparison with other fantasy teams.\n"
             "- **Strongest and weakest categories:** ranked against each other within your "
             "team.\n"
-            "- **Stats:** full-season projections. Games played so far count as played; current "
-            "injuries (ESPN plus your overrides file) remove known missed games, and teammates "
-            "get the extra minutes. Per-game rates are still pre-season."
+            "- **Stats:** the whole season: games already played as they happened, plus the "
+            "remaining games projected from preseason and this season's minutes and stats, "
+            "minus known injury absences. Teammates get injured players' minutes."
         )
